@@ -186,12 +186,16 @@ void walk(const std::vector<string> &requested, const string &state, VisitReposi
 					continue;
 				}
 
-				Fd dir;
-				if (entry->fts_ino == BTRFS_FIRST_FREE_OBJECTID) {
-					dir = open_path(path, O_RDONLY | O_DIRECTORY);
+				const Fd dir = open_path(path, O_RDONLY | O_DIRECTORY);
+				struct stat st {};
+				if (fstat(dir, &st) < 0) {
+					fts_set(tree.get(), entry, FTS_SKIP);
+					continue;
+				}
+				if (st.st_ino == BTRFS_FIRST_FREE_OBJECTID) {
 					uint64_t flags = 0;
 					if (!writable_btrfs(dir) ||
-						(ioctl(dir, BTRFS_IOC_SUBVOL_GETFLAGS, &flags) == 0 && (flags & BTRFS_SUBVOL_RDONLY))) {
+						ioctl(dir, BTRFS_IOC_SUBVOL_GETFLAGS, &flags) < 0 || (flags & BTRFS_SUBVOL_RDONLY)) {
 						fts_set(tree.get(), entry, FTS_SKIP);
 						continue;
 					}
@@ -200,20 +204,14 @@ void walk(const std::vector<string> &requested, const string &state, VisitReposi
 				if (scope.repo && string(entry->fts_name) == ".git") {
 					scope.metadata = true;
 				}
-				if (!scope.metadata) {
-					if (!dir) {
-						dir = open_path(path, O_RDONLY | O_DIRECTORY);
-					}
-					struct stat st {};
-					if (git_repository(dir) && fstat(dir, &st) == 0) {
-						crucible::BtrfsIoctlFsInfoArgs info;
-						if (info.do_ioctl_nothrow(dir) && info.sectorsize && info.sectorsize <= chunk_size) {
-							const auto uuid = info.fsid();
-							scope.repo = std::make_shared<Repository>(Repository {
-								path, identity(st), string(uuid.begin(), uuid.end()), info.sectorsize,
-							});
-							found(*scope.repo);
-						}
+				if (!scope.metadata && git_repository(dir)) {
+					crucible::BtrfsIoctlFsInfoArgs info;
+					if (info.do_ioctl_nothrow(dir) && info.sectorsize && info.sectorsize <= chunk_size) {
+						const auto uuid = info.fsid();
+						scope.repo = std::make_shared<Repository>(Repository {
+							path, identity(st), string(uuid.begin(), uuid.end()), info.sectorsize,
+						});
+						found(*scope.repo);
 					}
 				}
 				scopes.push_back(std::move(scope));
