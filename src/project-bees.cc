@@ -156,7 +156,8 @@ void walk(const std::vector<string> &requested, const string &state, VisitReposi
 			continue;
 		}
 		char *paths[] = {root.data(), nullptr};
-		std::unique_ptr<FTS, decltype(&fts_close)> tree(fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR, nullptr), fts_close);
+		std::unique_ptr<FTS, decltype(&fts_close)> tree(
+			fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_NOSTAT, nullptr), fts_close);
 		if (!tree) {
 			throw std::runtime_error("cannot open directory walk for " + root);
 		}
@@ -186,7 +187,7 @@ void walk(const std::vector<string> &requested, const string &state, VisitReposi
 				}
 
 				Fd dir;
-				if (entry->fts_statp->st_ino == 256) {
+				if (entry->fts_ino == BTRFS_FIRST_FREE_OBJECTID) {
 					dir = open_path(path, O_RDONLY | O_DIRECTORY);
 					uint64_t flags = 0;
 					if (!writable_btrfs(dir) ||
@@ -216,9 +217,11 @@ void walk(const std::vector<string> &requested, const string &state, VisitReposi
 					}
 				}
 				scopes.push_back(std::move(scope));
-			} else if (entry->fts_info == FTS_F && level && scopes.size() >= level && scopes[level - 1].repo) {
-				if (!mounts.count(entry->fts_path)) {
-					file(*scopes[level - 1].repo, entry->fts_path, *entry->fts_statp);
+			} else if ((entry->fts_info == FTS_F || entry->fts_info == FTS_NSOK) &&
+				level && scopes.size() >= level && scopes[level - 1].repo) {
+				struct stat st {};
+				if (!mounts.count(entry->fts_path) && lstat(entry->fts_path, &st) == 0 && S_ISREG(st.st_mode)) {
+					file(*scopes[level - 1].repo, entry->fts_path, st);
 				}
 			}
 		}
@@ -348,7 +351,8 @@ public:
 		db.reset(connection);
 		check(code, db.get());
 		check(sqlite3_busy_timeout(db.get(), 5000), db.get());
-		exec("PRAGMA cache_size = -8192; PRAGMA temp_store = FILE; PRAGMA foreign_keys = ON;"
+		exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;"
+			"PRAGMA cache_size = -8192; PRAGMA temp_store = FILE; PRAGMA foreign_keys = ON;"
 			"CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, path TEXT UNIQUE, root TEXT,"
 			" repo TEXT, fsid TEXT, seen INTEGER, pending INTEGER, device INTEGER, inode INTEGER,"
 			" size INTEGER, msec INTEGER, mnsec INTEGER, csec INTEGER, cnsec INTEGER);"
@@ -377,6 +381,7 @@ public:
 		std::array<char, chunk_size> buffer;
 		const std::array<char, chunk_size> zeros {};
 		size_t repositories = 0, changed = 0, indexed = 0, batch = 0;
+		auto next_report = std::chrono::steady_clock::now() + std::chrono::minutes(1);
 		exec("BEGIN");
 		walk(roots, state, [&](const Repository &) { ++repositories; },
 			[&](const Repository &repo, const string &path, const struct stat &st) {
@@ -386,6 +391,12 @@ public:
 			if (++batch == 512) {
 				exec("COMMIT; BEGIN");
 				batch = 0;
+				const auto now = std::chrono::steady_clock::now();
+				if (now >= next_report) {
+					std::cout << "scanning repositories=" << repositories << " hashed_files=" << changed
+						<< " indexed_chunks=" << indexed << std::endl;
+					next_report = now + std::chrono::minutes(1);
+				}
 			}
 			const Stamp stamp(st);
 			existing.bind(1, path);

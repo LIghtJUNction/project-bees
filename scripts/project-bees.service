@@ -6,8 +6,10 @@ ExecStart=%h/.local/bin/project-bees
 Restart=on-failure
 RestartSec=15s
 Nice=19
-IOSchedulingClass=idle
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 IOWeight=10
+MemoryHigh=256M
 NoNewPrivileges=yes
 
 [Install]

@@ -33,9 +33,10 @@ systemctl --user enable --now project-bees.service
 journalctl --user -u project-bees.service -f
 ```
 
-The service runs with low CPU and I/O priority. The default index directory is
-`${XDG_STATE_HOME:-$HOME/.local/state}/project-bees`. Use `--state-dir DIR` to
-keep separate indexes for different scans.
+The service runs with low CPU and I/O priority and a soft memory limit of
+256 MiB, including filesystem cache charged to the service. The default index
+directory is `${XDG_STATE_HOME:-$HOME/.local/state}/project-bees`. Use
+`--state-dir DIR` to keep separate indexes for different scans.
 
 ## Scope and resource use
 
