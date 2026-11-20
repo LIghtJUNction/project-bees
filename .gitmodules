@@ -1,0 +1,4 @@
+[submodule "plugins/project-bees"]
+	path = plugins/project-bees
+	url = https://github.com/LIghtJUNction/omarchy-project-bees.git
+	branch = main

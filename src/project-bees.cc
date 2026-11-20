@@ -10,6 +10,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <fts.h>
 #include <getopt.h>
 #include <iostream>
@@ -330,14 +331,145 @@ Fd open_indexed(const string &path, const string &root, const string &repo, cons
 	return current(fd, stamp) && writable_btrfs(fd) ? fd : Fd {};
 }
 
+using Extents = std::vector<crucible::FiemapExtent>;
+
+Extents extent_map(int fd, uint64_t offset, uint64_t length)
+{
+	crucible::Fiemap map(offset, length);
+	// Delayed or unknown allocations are excluded from the accounting.
+	map.m_flags = 0;
+	try {
+		map.do_ioctl(fd);
+	} catch (const std::system_error &) {
+		return {};
+	}
+	return std::move(map.m_extents);
+}
+
+bool allocated(const crucible::FiemapExtent &extent)
+{
+	constexpr auto uncertain = FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC |
+		FIEMAP_EXTENT_UNWRITTEN | FIEMAP_EXTENT_DATA_INLINE;
+	return extent.fe_physical && !(extent.fe_flags & uncertain);
+}
+
+uint64_t newly_shared(const Extents &before, int fd, uint64_t offset, uint64_t length)
+{
+	if (!length || std::none_of(before.begin(), before.end(), [](const auto &extent) {
+		return allocated(extent) && !(extent.fe_flags & FIEMAP_EXTENT_SHARED);
+	})) {
+		return 0;
+	}
+
+	const auto after = extent_map(fd, offset, length);
+	uint64_t bytes = 0;
+	for (const auto &old : before) {
+		if (!allocated(old) || (old.fe_flags & FIEMAP_EXTENT_SHARED)) {
+			continue;
+		}
+		for (const auto &now : after) {
+			if (!allocated(now) || !(now.fe_flags & FIEMAP_EXTENT_SHARED)) {
+				continue;
+			}
+			const auto start = std::max({offset, static_cast<uint64_t>(old.fe_logical),
+				static_cast<uint64_t>(now.fe_logical)});
+			const auto end = std::min({offset + length, static_cast<uint64_t>(old.fe_logical + old.fe_length),
+				static_cast<uint64_t>(now.fe_logical + now.fe_length)});
+			if (end > start) {
+				bytes += end - start;
+			}
+		}
+	}
+	return bytes;
+}
+
+string json_utf8(std::string_view data)
+{
+	string result;
+	result.reserve(data.size());
+	for (size_t i = 0; i < data.size();) {
+		const auto lead = static_cast<unsigned char>(data[i]);
+		size_t length = lead < 0x80 ? 1 :
+			lead >= 0xc2 && lead <= 0xdf ? 2 :
+			lead >= 0xe0 && lead <= 0xef ? 3 :
+			lead >= 0xf0 && lead <= 0xf4 ? 4 : 0;
+		bool valid = length && length <= data.size() - i;
+		for (size_t j = 1; valid && j < length; ++j) {
+			const auto next = static_cast<unsigned char>(data[i + j]);
+			valid = next >= 0x80 && next <= 0xbf;
+			if (j == 1) {
+				valid = valid && !(lead == 0xe0 && next < 0xa0) &&
+					!(lead == 0xed && next >= 0xa0) &&
+					!(lead == 0xf0 && next < 0x90) && !(lead == 0xf4 && next >= 0x90);
+			}
+		}
+		if (valid) {
+			result.append(data.data() + i, length);
+			i += length;
+		} else {
+			// Linux paths are byte strings. Keep database keys exact and replace
+			// invalid bytes only in the JSON text displayed by consumers.
+			result += "\\ufffd";
+			++i;
+		}
+	}
+	return result;
+}
+
+// Publish a complete snapshot so readers can open it during any index transaction.
+void publish_stats(sqlite3 *sql, const string &state)
+{
+	Statement snapshot(sql, R"SQL(
+		WITH credit(path, dest_bytes, source_bytes) AS (
+			SELECT path, 0, 0 FROM repositories
+			UNION ALL SELECT destination, bytes, 0 FROM dedup_totals
+			UNION ALL SELECT source, 0, bytes FROM dedup_totals
+		), projects AS (
+			SELECT path, sum(dest_bytes) AS bytes, sum(source_bytes) AS source_bytes
+			FROM credit GROUP BY path ORDER BY bytes DESC, path
+		), pairs AS (
+			SELECT min(source, destination) AS a, max(source, destination) AS b,
+				sum(bytes) AS bytes, sum(CASE WHEN destination < source THEN bytes ELSE 0 END) AS to_a
+			FROM dedup_totals GROUP BY a,b ORDER BY bytes DESC, a,b
+		)
+		SELECT json_object(
+			'version', 1,
+			'startedAt', (SELECT started_at FROM stats_epoch),
+			'updatedAt', unixepoch(),
+			'totalBytes', (SELECT coalesce(sum(bytes),0) FROM dedup_totals),
+			'rangeCount', (SELECT coalesce(sum(ranges),0) FROM dedup_totals),
+			'projects', json((SELECT json_group_array(json_object(
+				'path', CAST(path AS TEXT), 'bytes', bytes, 'sourceBytes', source_bytes)) FROM projects)),
+			'pairs', json((SELECT json_group_array(json_object(
+				'a', CAST(a AS TEXT), 'b', CAST(b AS TEXT), 'bytes', bytes, 'toA', to_a)) FROM pairs))
+		)
+	)SQL");
+	snapshot.next();
+	auto data = json_utf8(snapshot.bytes(0));
+	data.push_back('\n');
+	string temp = state + "/.stats.XXXXXX";
+	const Fd fd = mkstemp(temp.data());
+	if (!fd) {
+		throw std::system_error(errno, std::generic_category(), "create statistics snapshot");
+	}
+	try {
+		crucible::write_or_die(fd, data);
+		crucible::rename_or_die(temp, state + "/stats.json");
+	} catch (...) {
+		unlink(temp.c_str());
+		throw;
+	}
+}
+
 class Index {
 	Fd lock;
 	std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db {nullptr, sqlite3_close};
+	const string state;
 
 	void exec(const char *sql) { check(sqlite3_exec(db.get(), sql, nullptr, nullptr, nullptr), db.get()); }
 
 public:
-	explicit Index(const string &state)
+	explicit Index(const string &directory) : state(directory)
 	{
 		lock = open((state + "/lock").c_str(), O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_RDWR, 0600);
 		if (!lock || flock(lock, LOCK_EX | LOCK_NB) < 0) {
@@ -357,13 +489,20 @@ public:
 			"CREATE INDEX IF NOT EXISTS files_pending ON files (pending, id);"
 			"CREATE TABLE IF NOT EXISTS chunks (file INTEGER REFERENCES files(id) ON DELETE CASCADE,"
 			" start INTEGER, length INTEGER, hash INTEGER, PRIMARY KEY(file, start)) WITHOUT ROWID;"
-			"CREATE INDEX IF NOT EXISTS chunk_match ON chunks (hash, length, file);");
+			"CREATE INDEX IF NOT EXISTS chunk_match ON chunks (hash, length, file);"
+			"CREATE TABLE IF NOT EXISTS repositories (path BLOB PRIMARY KEY, seen INTEGER) WITHOUT ROWID;"
+			"CREATE TABLE IF NOT EXISTS dedup_totals (source BLOB, destination BLOB,"
+			" bytes INTEGER NOT NULL, ranges INTEGER NOT NULL, PRIMARY KEY(source,destination)) WITHOUT ROWID;"
+			"CREATE TABLE IF NOT EXISTS stats_epoch (id INTEGER PRIMARY KEY, started_at INTEGER);"
+			"INSERT OR IGNORE INTO stats_epoch VALUES (1, unixepoch());");
+		publish_stats(db.get(), state);
 	}
 
-	void scan(const std::vector<string> &roots, const string &state)
+	void scan(const std::vector<string> &roots)
 	{
 		auto *sql = db.get();
-		Statement latest(sql, "SELECT coalesce(max(seen),0) + 1 FROM files");
+		Statement latest(sql, "SELECT max(coalesce((SELECT max(seen) FROM files),0),"
+			" coalesce((SELECT max(seen) FROM repositories),0)) + 1");
 		latest.next();
 		const auto round = latest.number(0);
 		latest.reset();
@@ -375,26 +514,33 @@ public:
 		Statement add(sql, "INSERT INTO files(path,root,repo,fsid,seen,pending,device,inode,size,msec,mnsec,csec,cnsec)"
 			" VALUES(?,?,?,?,?,1,?,?,?,?,?,?,?)");
 		Statement add_chunk(sql, "INSERT INTO chunks VALUES (?,?,?,?)");
+		Statement add_repo(sql, "INSERT INTO repositories VALUES (?,?)"
+			" ON CONFLICT(path) DO UPDATE SET seen=excluded.seen");
 
 		std::array<char, chunk_size> buffer;
 		const std::array<char, chunk_size> zeros {};
 		size_t repositories = 0, changed = 0, indexed = 0, batch = 0;
 		auto next_report = std::chrono::steady_clock::now() + std::chrono::minutes(1);
 		exec("BEGIN");
-		walk(roots, state, [&](const Repository &) { ++repositories; },
+		walk(roots, state, [&](const Repository &repo) {
+			add_repo.bind(1, repo.path).bind(2, round).run();
+			++repositories;
+		},
 			[&](const Repository &repo, const string &path, const struct stat &st) {
 			if (st.st_nlink != 1 || !st.st_blocks || st.st_size < static_cast<off_t>(repo.sector_size)) {
 				return;
 			}
 			if (++batch == 512) {
-				exec("COMMIT; BEGIN");
+				exec("COMMIT");
 				batch = 0;
 				const auto now = std::chrono::steady_clock::now();
 				if (now >= next_report) {
+					publish_stats(sql, state);
 					std::cout << "scanning repositories=" << repositories << " hashed_files=" << changed
 						<< " indexed_chunks=" << indexed << std::endl;
 					next_report = now + std::chrono::minutes(1);
 				}
+				exec("BEGIN");
 			}
 			const Stamp stamp(st);
 			existing.bind(1, path);
@@ -453,8 +599,11 @@ public:
 		if (!stopping) {
 			Statement prune(sql, "DELETE FROM files WHERE seen<>?");
 			prune.bind(1, round).run();
+			Statement prune_repositories(sql, "DELETE FROM repositories WHERE seen<>?");
+			prune_repositories.bind(1, round).run();
 		}
 		exec("COMMIT");
+		publish_stats(sql, state);
 		std::cout << "scan repositories=" << repositories << " hashed_files=" << changed
 			<< " indexed_chunks=" << indexed << (stopping ? " interrupted" : "") << std::endl;
 	}
@@ -481,18 +630,22 @@ public:
 			" f.msec,f.mnsec,f.csec,f.cnsec,c.start FROM chunks c JOIN files f ON f.id=c.file"
 			" WHERE c.hash=? AND c.length=? AND f.fsid=? AND f.repo<>? ORDER BY c.file");
 		Statement done(sql, "UPDATE files SET pending=0 WHERE id=?");
+		Statement record(sql, "INSERT INTO dedup_totals VALUES (?,?,?,1)"
+			" ON CONFLICT(source,destination) DO UPDATE SET bytes=bytes+excluded.bytes, ranges=ranges+1");
 
 		Integer id = 0;
-		uint64_t bytes = 0, ranges = 0, rejected = 0;
+		uint64_t bytes = 0, shared = 0, ranges = 0, rejected = 0;
 		int last_error = 0;
 		unsigned batch = 0;
+		auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
 		exec("BEGIN");
 		while (!stopping && pending.bind(1, id).next()) {
 			id = pending.number(0);
 			const auto root = pending.bytes(2);
 			const auto repo = pending.bytes(3);
 			const auto fsid = pending.bytes(4);
-			const Fd dest = open_indexed(pending.bytes(1), root, repo, Stamp(pending, 5));
+			const Stamp dest_stamp(pending, 5);
+			const Fd dest = open_indexed(pending.bytes(1), root, repo, dest_stamp);
 			pending.reset();
 			bool retry = false;
 			if (static_cast<int>(dest) >= 0) {
@@ -502,6 +655,8 @@ public:
 				while (!stopping && chunks.next()) {
 					const auto offset = chunks.number(0);
 					const auto length = chunks.number(1);
+					Extents before;
+					bool mapped = false;
 					sources.bind(1, chunks.number(2)).bind(2, length).bind(3, fsid).bind(4, repo);
 					while (!stopping && sources.next()) {
 						if (source_id != sources.number(0)) {
@@ -511,6 +666,10 @@ public:
 						}
 						if (!source) {
 							continue;
+						}
+						if (!mapped) {
+							before = extent_map(dest, offset, length);
+							mapped = true;
 						}
 						crucible::BtrfsExtentSame same(source, sources.number(11), length);
 						same.add(dest, offset);
@@ -522,7 +681,13 @@ public:
 							status = -error.code().value();
 						}
 						if (status == 0) {
-							bytes += same.m_info.front().bytes_deduped;
+							const auto accepted = same.m_info.front().bytes_deduped;
+							const auto added = newly_shared(before, dest, offset, accepted);
+							if (added && current(dest, dest_stamp)) {
+								record.bind(1, sources.bytes(2)).bind(2, root).bind(3, added).run();
+								shared += added;
+							}
+							bytes += accepted;
 							++ranges;
 							break;
 						}
@@ -544,13 +709,21 @@ public:
 				done.bind(1, id).run();
 			}
 			if (++batch == 512) {
-				exec("COMMIT; BEGIN");
+				exec("COMMIT");
+				const auto now = std::chrono::steady_clock::now();
+				if (now >= next_report) {
+					publish_stats(sql, state);
+					next_report = now + std::chrono::seconds(10);
+				}
+				exec("BEGIN");
 				batch = 0;
 			}
 		}
 		pending.reset();
 		exec("COMMIT");
+		publish_stats(sql, state);
 		std::cout << "dedup ranges=" << ranges << " kernel_bytes=" << bytes
+			<< " newly_shared_bytes=" << shared
 			<< " rejected=" << rejected << " last_status=" << last_error
 			<< (stopping ? " interrupted" : "") << std::endl;
 	}
@@ -575,7 +748,7 @@ int main(int argc, char **argv)
 try {
 	std::vector<string> roots;
 	string state;
-	bool once = false, discover = false;
+	bool once = false, discover = false, stats = false;
 	long interval = 300;
 	const option options[] = {
 		{"root", required_argument, nullptr, 'r'},
@@ -583,10 +756,11 @@ try {
 		{"interval", required_argument, nullptr, 'i'},
 		{"once", no_argument, nullptr, '1'},
 		{"discover", no_argument, nullptr, 'd'},
+		{"stats", no_argument, nullptr, 't'},
 		{"help", no_argument, nullptr, 'h'},
 		{nullptr, 0, nullptr, 0},
 	};
-	for (int opt; (opt = getopt_long(argc, argv, "r:s:i:1dh", options, nullptr)) != -1;) {
+	for (int opt; (opt = getopt_long(argc, argv, "r:s:i:1dth", options, nullptr)) != -1;) {
 		switch (opt) {
 		case 'r':
 			roots.push_back(fs::canonical(optarg).string());
@@ -605,22 +779,32 @@ try {
 		}
 		case '1': once = true; break;
 		case 'd': discover = true; break;
+		case 't': stats = true; break;
 		case 'h':
 			std::cout << "Usage: project-bees [--root DIR]... [--state-dir DIR]\n"
-				"                    [--interval SECONDS] [--once | --discover]\n"
+				"                    [--interval SECONDS] [--once | --discover | --stats]\n"
 				"Discover Git repositories on mounted writable Btrfs filesystems and deduplicate\n"
-				"ranges across repositories. The default interval is 300 seconds after each pass.\n";
+				"ranges across repositories. The default interval is 300 seconds after each pass.\n"
+				"--stats prints the daemon's cumulative statistics as JSON.\n";
 			return 0;
 		default: return 2;
 		}
 	}
-	if (optind != argc || (once && discover)) {
+	if (optind != argc || once + discover + stats > 1) {
 		throw std::runtime_error("invalid arguments; see --help");
 	}
 	std::signal(SIGINT, stop);
 	std::signal(SIGTERM, stop);
 	umask(0077);
 	state = fs::weakly_canonical(fs::absolute(state.empty() ? state_directory() : state)).string();
+	if (stats) {
+		std::ifstream report(state + "/stats.json");
+		if (!report) {
+			throw std::runtime_error("statistics unavailable; run project-bees to initialize this state directory");
+		}
+		std::cout << report.rdbuf();
+		return std::cout ? 0 : 1;
+	}
 	if (discover) {
 		walk(roots, state, [](const Repository &repo) { std::cout << repo.path << '\n'; },
 			[](const Repository &, const string &, const struct stat &) {});
@@ -630,7 +814,7 @@ try {
 	Index index(state);
 	std::cout << "project-bees running, scan interval=" << interval << "s" << std::endl;
 	while (!stopping) {
-		index.scan(roots, state);
+		index.scan(roots);
 		if (!stopping) {
 			index.dedup();
 		}

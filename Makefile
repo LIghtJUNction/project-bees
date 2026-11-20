@@ -72,6 +72,8 @@ install: install-project-bees
 
 install-project-bees: project-bees ## Install project-bees
 	install -Dm755 bin/project-bees $(DESTDIR)$(PREFIX)/bin/project-bees
+	install -Dm644 scripts/project-bees.service $(DESTDIR)$(LIB_PREFIX)/systemd/user/project-bees.service
+	sed -i 's|^ExecStart=.*|ExecStart=$(PREFIX)/bin/project-bees|' $(DESTDIR)$(LIB_PREFIX)/systemd/user/project-bees.service
 
 install-user: project-bees ## Install the executable and user systemd unit
 	install -Dm755 bin/project-bees "$(HOME)/.local/bin/project-bees"

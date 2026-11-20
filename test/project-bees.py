@@ -2,6 +2,7 @@
 
 import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -70,9 +71,11 @@ def test(root):
     bare = scan / "bare.git"
     worktree = scan / "worktree"
     fake = scan / "fake"
-    git("init", "-q", a)
-    git("init", "-q", nested)
-    git("init", "-q", "--bare", bare)
+    template = root / "empty-template"
+    template.mkdir()
+    git("init", "-q", f"--template={template}", a)
+    git("init", "-q", f"--template={template}", nested)
+    git("init", "-q", "--bare", f"--template={template}", bare)
     git("-C", a, "-c", "user.name=Test", "-c", "user.email=test@example.com",
         "commit", "--allow-empty", "-qm", "initial")
     git("-C", a, "worktree", "add", "-q", "-b", "test-worktree", worktree)
@@ -80,6 +83,16 @@ def test(root):
     (scan / "symlink-repo").symlink_to(a)
     (a / "symlink-external").symlink_to(fake)
     args = [BINARY, "--root", scan, "--state-dir", root / "state"]
+    stats_args = [BINARY, "--state-dir", root / "state", "--stats"]
+
+    def stats(expected):
+        report = json.loads(subprocess.check_output(stats_args))
+        assert report["totalBytes"] == expected, report
+        assert sum(proj["bytes"] for proj in report["projects"]) == expected
+        assert sum(proj["sourceBytes"] for proj in report["projects"]) == expected
+        assert sum(pair["bytes"] for pair in report["pairs"]) == expected
+        return report
+
     discovered = subprocess.check_output([*args, "--discover"], text=True).splitlines()
     assert set(discovered) == {str(a), str(nested), str(bare), str(worktree)}, discovered
 
@@ -103,6 +116,14 @@ def test(root):
     assert not shared(solo1, solo2)
     assert before == {path: digest(path) for path in before}
     assert b_file.stat().st_mode & 0o777 == 0o444
+    report = stats(2 * len(common))
+    assert {proj["path"] for proj in report["projects"]} == set(discovered)
+    assert len(report["pairs"]) == 1
+    assert {report["pairs"][0]["a"], report["pairs"][0]["b"]} == {str(a), str(nested)}
+    # Force a rescan of an already shared file and keep the persisted total.
+    os.utime(a_file, None)
+    subprocess.run([*args, "--once"], check=True, capture_output=True)
+    assert stats(2 * len(common))["startedAt"] == report["startedAt"]
 
     log = root / "daemon.log"
     with log.open("w") as output, subprocess.Popen(
@@ -111,7 +132,7 @@ def test(root):
         try:
             wait_for(lambda: "hashed_files=0" in log.read_text(), daemon, log)
             newcomer = scan / "new"
-            git("init", "-q", newcomer)
+            git("init", "-q", f"--template={template}", newcomer)
             new_file = put(newcomer / "duplicate", common)
             wait_for(lambda: shared(a_file, new_file) or shared(b_file, new_file), daemon, log)
             update = put(worktree / "changed", os.urandom(len(inside)))
@@ -131,7 +152,51 @@ def test(root):
             daemon.terminate()
             assert daemon.wait(timeout=10) == 0, log.read_text()
 
-    print("Passed Git discovery, cross-repository physical sharing, scope, content, and daemon updates")
+    stats(3 * len(common) + 2 * len(inside))
+    print("Passed Git discovery, physical sharing, scope, live updates, and persistent deduplication statistics")
+
+
+def test_stats_encoding(root):
+    scan = root / "encoding"
+    scan.mkdir()
+    state = root / "encoding-state"
+    template = root / "empty-template"
+    names = [
+        ("unicode-¢-仓库-🐝".encode(), "unicode-¢-仓库-🐝"),
+        (b'escaped-"-\\-\n-\t', 'escaped-"-\\-\n-\t'),
+        (b"invalid-\xff\x80", "invalid-\ufffd\ufffd"),
+        (b"overlong-\xc0\xaf\xe0\x80\xaf", "overlong-" + "\ufffd" * 5),
+        (b"surrogate-\xed\xa0\x80", "surrogate-" + "\ufffd" * 3),
+        (b"out-of-range-\xf4\x90\x80\x80", "out-of-range-" + "\ufffd" * 4),
+        (b"truncated-\xe2\x82", "truncated-\ufffd\ufffd"),
+        (b"broken-\xe2(\xa1", "broken-\ufffd(\ufffd"),
+    ]
+    content = os.urandom(32 * 1024)
+    expected_paths = {str(scan) + "/" + display for _, display in names}
+    raw_paths = set()
+    for raw, _ in names:
+        path = os.fsencode(scan) + b"/" + raw
+        raw_paths.add(path)
+        repo = Path(os.fsdecode(path))
+        git("init", "-q", f"--template={template}", repo)
+        put(repo / "common", content)
+
+    args = [BINARY, "--root", scan, "--state-dir", state, "--once"]
+    subprocess.run(args, check=True, capture_output=True)
+    raw_report = subprocess.check_output([BINARY, "--state-dir", state, "--stats"])
+    assert raw_report == (state / "stats.json").read_bytes()
+    report = json.loads(raw_report.decode("utf-8"))
+    assert {row["path"] for row in report["projects"]} == expected_paths, report
+    assert all(row["a"] in expected_paths and row["b"] in expected_paths for row in report["pairs"])
+    assert report["totalBytes"] == (len(names) - 1) * len(content), report
+    assert sum(row["bytes"] for row in report["projects"]) == report["totalBytes"]
+    assert sum(row["bytes"] for row in report["pairs"]) == report["totalBytes"]
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert {row[0] for row in db.execute("SELECT path FROM repositories")} == raw_paths
+    subprocess.run(args, check=True, capture_output=True)
+    repeated = json.loads((state / "stats.json").read_text(encoding="utf-8"))
+    assert repeated["totalBytes"] == report["totalBytes"]
+    print("Passed UTF-8 statistics, JSON escaping, exact path keys, and repeat-scan accounting")
 
 
 if __name__ == "__main__":
@@ -141,3 +206,4 @@ if __name__ == "__main__":
         raise SystemExit("Set PROJECT_BEES_TEST_DIR to a writable directory on Btrfs")
     with tempfile.TemporaryDirectory(prefix="project-bees-test-", dir=test_parent) as directory:
         test(Path(directory))
+        test_stats_encoding(Path(directory))
