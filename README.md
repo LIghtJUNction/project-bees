@@ -36,6 +36,8 @@ omarchy plugin add https://github.com/LIghtJUNction/omarchy-project-bees --enabl
 
 Click its bar widget or run
 `omarchy-shell shell summon io.github.lightjunction.project-bees` to open it.
+The dashboard also shows whether the latest snapshot reports indexing,
+deduplication, a wait before the next scan, or a stopped daemon.
 The plugin is independently maintained under the MIT license and pinned in
 this repository at `plugins/project-bees` as a Git submodule. It reads the
 daemon's local statistics snapshot.
@@ -113,6 +115,46 @@ is replaced by U+FFFD in JSON. Valid Unicode, quotes, backslashes, and control
 characters remain valid JSON strings. The snapshot is private to the service's
 user and contains local repository paths.
 
+### Activity and an initial total of zero
+
+Each pass first indexes the repository files, then deduplicates matching
+ranges. The first index can take a long time on a large repository tree.
+During that stage, the newly shared total can stay at zero while the file and
+chunk counters grow. A zero total by itself does not show whether the daemon
+is working. The default 300-second interval is the delay **after both stages
+finish**, not a limit on indexing time.
+
+Since 0.1.1, snapshots also include an optional `activity` object. Its counters
+describe the current pass and reset when a new scan starts; the cumulative
+statistics above keep their history.
+
+| Activity field | Meaning |
+| --- | --- |
+| `phase` | `scanning`, `deduplicating`, `idle`, or `stopped` |
+| `phaseStartedAt` | Time this phase began, as Unix seconds |
+| `repositories` | Repository visits in the current scan |
+| `scannedFiles` | Eligible file visits in the current scan, including cached files |
+| `hashedFiles` | Files successfully read and indexed in this scan |
+| `indexedChunks` | Nonzero chunks hashed in this scan |
+| `processedFiles` | Pending files checked during deduplication |
+| `matchedRanges` | Ranges accepted by Btrfs, including already shared ranges |
+| `rejectedRanges` | Deduplication attempts rejected by Btrfs |
+| `nextScanAt` | Planned next scan time while idle; zero in other phases |
+
+Read the activity together with `updatedAt`: a saved phase is not a liveness
+check. The dashboard marks old active snapshots as stale instead of claiming
+the daemon is still working. Older snapshots without activity remain readable.
+Check the actual service and its recent progress with:
+
+```sh
+systemctl --user status project-bees.service
+journalctl --user -u project-bees.service -n 20
+```
+
+Stopping during indexing preserves completed hash batches, but a restart
+begins directory traversal again. Let an initial scan finish when possible;
+repeated restarts delay its first deduplication stage.
+
 ## Scope and resource use
 
 - The discovery pass walks accessible directories on mounted, writable
@@ -139,7 +181,8 @@ Run `make test-project-bees` from a Btrfs checkout, or set
 physical extent sharing, content preservation, repository scope, and live
 discovery of additions and edits. It also checks cumulative totals, restart
 persistence, repeat-scan accounting, and statistics for non-UTF-8 repository
-names. `make test` runs the upstream unit tests.
+names, plus activity counters and phase transitions. `make test` runs the
+upstream unit tests.
 
 The [upstream documentation](https://zygo.github.io/bees/) describes the
 original filesystem-wide daemon. This fork retains the upstream source and

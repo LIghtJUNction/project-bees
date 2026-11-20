@@ -63,6 +63,24 @@ def wait_for(predicate, process, log):
     raise AssertionError(log.read_text())
 
 
+def check_activity(report, phase=None):
+    assert report["version"] == 1, report
+    activity = report["activity"]
+    assert activity["phase"] in {"scanning", "deduplicating", "idle", "stopped"}, activity
+    if phase is not None:
+        assert activity["phase"] == phase, activity
+    for field in ("phaseStartedAt", "repositories", "scannedFiles", "hashedFiles",
+                  "indexedChunks", "processedFiles", "matchedRanges", "rejectedRanges", "nextScanAt"):
+        assert type(activity[field]) is int and activity[field] >= 0, activity
+    assert 0 < activity["phaseStartedAt"] <= report["updatedAt"], activity
+    assert activity["hashedFiles"] <= activity["scannedFiles"], activity
+    if activity["phase"] == "idle":
+        assert activity["nextScanAt"] > activity["phaseStartedAt"], activity
+    else:
+        assert activity["nextScanAt"] == 0, activity
+    return activity
+
+
 def test(root):
     scan = root / "scan"
     scan.mkdir()
@@ -87,6 +105,7 @@ def test(root):
 
     def stats(expected):
         report = json.loads(subprocess.check_output(stats_args))
+        check_activity(report, "stopped")
         assert report["totalBytes"] == expected, report
         assert sum(proj["bytes"] for proj in report["projects"]) == expected
         assert sum(proj["sourceBytes"] for proj in report["projects"]) == expected
@@ -120,10 +139,19 @@ def test(root):
     assert {proj["path"] for proj in report["projects"]} == set(discovered)
     assert len(report["pairs"]) == 1
     assert {report["pairs"][0]["a"], report["pairs"][0]["b"]} == {str(a), str(nested)}
+    activity = report["activity"]
+    assert activity["repositories"] == 4, activity
+    assert activity["scannedFiles"] == activity["hashedFiles"] >= 5, activity
+    assert activity["processedFiles"] == activity["hashedFiles"], activity
+    assert activity["indexedChunks"] >= 19, activity
+    assert activity["matchedRanges"] >= report["rangeCount"] > 0, activity
     # Force a rescan of an already shared file and keep the persisted total.
     os.utime(a_file, None)
     subprocess.run([*args, "--once"], check=True, capture_output=True)
-    assert stats(2 * len(common))["startedAt"] == report["startedAt"]
+    repeated = stats(2 * len(common))
+    assert repeated["startedAt"] == report["startedAt"]
+    assert repeated["activity"]["hashedFiles"] == 1, repeated["activity"]
+    assert repeated["activity"]["indexedChunks"] == 5, repeated["activity"]
 
     log = root / "daemon.log"
     with log.open("w") as output, subprocess.Popen(
@@ -131,6 +159,17 @@ def test(root):
     ) as daemon:
         try:
             wait_for(lambda: "hashed_files=0" in log.read_text(), daemon, log)
+
+            def idle():
+                current = json.loads((root / "state" / "stats.json").read_text())
+                activity = check_activity(current)
+                if activity["phase"] != "idle":
+                    return False
+                assert activity["nextScanAt"] == activity["phaseStartedAt"] + 1, activity
+                assert activity["hashedFiles"] == activity["indexedChunks"] == 0, activity
+                return True
+
+            wait_for(idle, daemon, log)
             newcomer = scan / "new"
             git("init", "-q", f"--template={template}", newcomer)
             new_file = put(newcomer / "duplicate", common)
@@ -153,7 +192,7 @@ def test(root):
             assert daemon.wait(timeout=10) == 0, log.read_text()
 
     stats(3 * len(common) + 2 * len(inside))
-    print("Passed Git discovery, physical sharing, scope, live updates, and persistent deduplication statistics")
+    print("Passed Git discovery, physical sharing, scope, live updates, persistent statistics, and activity states")
 
 
 def test_stats_encoding(root):
@@ -186,6 +225,10 @@ def test_stats_encoding(root):
     raw_report = subprocess.check_output([BINARY, "--state-dir", state, "--stats"])
     assert raw_report == (state / "stats.json").read_bytes()
     report = json.loads(raw_report.decode("utf-8"))
+    activity = check_activity(report, "stopped")
+    assert activity["repositories"] == len(names), activity
+    assert activity["scannedFiles"] == activity["hashedFiles"] == len(names), activity
+    assert activity["indexedChunks"] == activity["processedFiles"] == len(names), activity
     assert {row["path"] for row in report["projects"]} == expected_paths, report
     assert all(row["a"] in expected_paths and row["b"] in expected_paths for row in report["pairs"])
     assert report["totalBytes"] == (len(names) - 1) * len(content), report
@@ -195,6 +238,10 @@ def test_stats_encoding(root):
         assert {row[0] for row in db.execute("SELECT path FROM repositories")} == raw_paths
     subprocess.run(args, check=True, capture_output=True)
     repeated = json.loads((state / "stats.json").read_text(encoding="utf-8"))
+    activity = check_activity(repeated, "stopped")
+    assert activity["scannedFiles"] == len(names), activity
+    assert activity["hashedFiles"] == activity["indexedChunks"] == activity["processedFiles"] == 0, activity
+    assert activity["matchedRanges"] == activity["rejectedRanges"] == 0, activity
     assert repeated["totalBytes"] == report["totalBytes"]
     print("Passed UTF-8 statistics, JSON escaping, exact path keys, and repeat-scan accounting")
 

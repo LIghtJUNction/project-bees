@@ -416,8 +416,21 @@ string json_utf8(std::string_view data)
 	return result;
 }
 
+Integer unix_time()
+{
+	return std::chrono::duration_cast<std::chrono::seconds>(
+		std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+struct Activity {
+	string phase = "stopped";
+	Integer phase_started_at = unix_time();
+	Integer repositories = 0, scanned_files = 0, hashed_files = 0, indexed_chunks = 0;
+	Integer processed_files = 0, matched_ranges = 0, rejected_ranges = 0, next_scan_at = 0;
+};
+
 // Publish a complete snapshot so readers can open it during any index transaction.
-void publish_stats(sqlite3 *sql, const string &state)
+void publish_stats(sqlite3 *sql, const string &state, const Activity &activity)
 {
 	Statement snapshot(sql, R"SQL(
 		WITH credit(path, dest_bytes, source_bytes) AS (
@@ -438,13 +451,21 @@ void publish_stats(sqlite3 *sql, const string &state)
 			'updatedAt', unixepoch(),
 			'totalBytes', (SELECT coalesce(sum(bytes),0) FROM dedup_totals),
 			'rangeCount', (SELECT coalesce(sum(ranges),0) FROM dedup_totals),
+			'activity', json_object(
+				'phase', CAST(? AS TEXT), 'phaseStartedAt', ?,
+				'repositories', ?, 'scannedFiles', ?, 'hashedFiles', ?, 'indexedChunks', ?,
+				'processedFiles', ?, 'matchedRanges', ?, 'rejectedRanges', ?, 'nextScanAt', ?),
 			'projects', json((SELECT json_group_array(json_object(
 				'path', CAST(path AS TEXT), 'bytes', bytes, 'sourceBytes', source_bytes)) FROM projects)),
 			'pairs', json((SELECT json_group_array(json_object(
 				'a', CAST(a AS TEXT), 'b', CAST(b AS TEXT), 'bytes', bytes, 'toA', to_a)) FROM pairs))
 		)
 	)SQL");
-	snapshot.next();
+	snapshot.bind(1, activity.phase).bind(2, activity.phase_started_at)
+		.bind(3, activity.repositories).bind(4, activity.scanned_files)
+		.bind(5, activity.hashed_files).bind(6, activity.indexed_chunks)
+		.bind(7, activity.processed_files).bind(8, activity.matched_ranges)
+		.bind(9, activity.rejected_ranges).bind(10, activity.next_scan_at).next();
 	auto data = json_utf8(snapshot.bytes(0));
 	data.push_back('\n');
 	string temp = state + "/.stats.XXXXXX";
@@ -465,8 +486,19 @@ class Index {
 	Fd lock;
 	std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db {nullptr, sqlite3_close};
 	const string state;
+	Activity activity;
 
 	void exec(const char *sql) { check(sqlite3_exec(db.get(), sql, nullptr, nullptr, nullptr), db.get()); }
+
+	void publish() { publish_stats(db.get(), state, activity); }
+
+	void phase(const string &name, long delay = 0)
+	{
+		activity.phase = name;
+		activity.phase_started_at = unix_time();
+		activity.next_scan_at = delay ? activity.phase_started_at + delay : 0;
+		publish();
+	}
 
 public:
 	explicit Index(const string &directory) : state(directory)
@@ -495,11 +527,13 @@ public:
 			" bytes INTEGER NOT NULL, ranges INTEGER NOT NULL, PRIMARY KEY(source,destination)) WITHOUT ROWID;"
 			"CREATE TABLE IF NOT EXISTS stats_epoch (id INTEGER PRIMARY KEY, started_at INTEGER);"
 			"INSERT OR IGNORE INTO stats_epoch VALUES (1, unixepoch());");
-		publish_stats(db.get(), state);
+		publish();
 	}
 
 	void scan(const std::vector<string> &roots)
 	{
+		activity = Activity {};
+		phase("scanning");
 		auto *sql = db.get();
 		Statement latest(sql, "SELECT max(coalesce((SELECT max(seen) FROM files),0),"
 			" coalesce((SELECT max(seen) FROM repositories),0)) + 1");
@@ -519,25 +553,27 @@ public:
 
 		std::array<char, chunk_size> buffer;
 		const std::array<char, chunk_size> zeros {};
-		size_t repositories = 0, changed = 0, indexed = 0, batch = 0;
+		size_t batch = 0;
 		auto next_report = std::chrono::steady_clock::now() + std::chrono::minutes(1);
 		exec("BEGIN");
 		walk(roots, state, [&](const Repository &repo) {
 			add_repo.bind(1, repo.path).bind(2, round).run();
-			++repositories;
+			++activity.repositories;
 		},
 			[&](const Repository &repo, const string &path, const struct stat &st) {
 			if (st.st_nlink != 1 || !st.st_blocks || st.st_size < static_cast<off_t>(repo.sector_size)) {
 				return;
 			}
+			++activity.scanned_files;
 			if (++batch == 512) {
 				exec("COMMIT");
 				batch = 0;
 				const auto now = std::chrono::steady_clock::now();
 				if (now >= next_report) {
-					publish_stats(sql, state);
-					std::cout << "scanning repositories=" << repositories << " hashed_files=" << changed
-						<< " indexed_chunks=" << indexed << std::endl;
+					publish();
+					std::cout << "scanning repositories=" << activity.repositories
+						<< " hashed_files=" << activity.hashed_files
+						<< " indexed_chunks=" << activity.indexed_chunks << std::endl;
 					next_report = now + std::chrono::minutes(1);
 				}
 				exec("BEGIN");
@@ -586,14 +622,14 @@ public:
 				if (std::memcmp(buffer.data(), zeros.data(), len)) {
 					const auto hash = CityHash64(buffer.data(), len);
 					add_chunk.bind(1, id).bind(2, offset).bind(3, len).bind(4, hash).run();
-					++indexed;
+					++activity.indexed_chunks;
 				}
 				offset += len;
 			}
 			if (!complete || !current(fd, stamp)) {
 				remove.bind(1, path).run();
 			} else {
-				++changed;
+				++activity.hashed_files;
 			}
 		});
 		if (!stopping) {
@@ -603,13 +639,14 @@ public:
 			prune_repositories.bind(1, round).run();
 		}
 		exec("COMMIT");
-		publish_stats(sql, state);
-		std::cout << "scan repositories=" << repositories << " hashed_files=" << changed
-			<< " indexed_chunks=" << indexed << (stopping ? " interrupted" : "") << std::endl;
+		publish();
+		std::cout << "scan repositories=" << activity.repositories << " hashed_files=" << activity.hashed_files
+			<< " indexed_chunks=" << activity.indexed_chunks << (stopping ? " interrupted" : "") << std::endl;
 	}
 
 	void dedup()
 	{
+		phase("deduplicating");
 		auto *sql = db.get();
 		Statement has_existing(sql, "SELECT 1 FROM files WHERE pending=0 LIMIT 1");
 		const bool have_existing = has_existing.next();
@@ -634,7 +671,7 @@ public:
 			" ON CONFLICT(source,destination) DO UPDATE SET bytes=bytes+excluded.bytes, ranges=ranges+1");
 
 		Integer id = 0;
-		uint64_t bytes = 0, shared = 0, ranges = 0, rejected = 0;
+		uint64_t bytes = 0, shared = 0;
 		int last_error = 0;
 		unsigned batch = 0;
 		auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -688,10 +725,10 @@ public:
 								shared += added;
 							}
 							bytes += accepted;
-							++ranges;
+							++activity.matched_ranges;
 							break;
 						}
-						++rejected;
+						++activity.rejected_ranges;
 						last_error = status;
 						if (status == -ENOSPC || status == -ENOMEM || status == -EAGAIN || status == -EINTR) {
 							retry = true;
@@ -708,11 +745,14 @@ public:
 			if (!retry && !stopping) {
 				done.bind(1, id).run();
 			}
+			if (!stopping) {
+				++activity.processed_files;
+			}
 			if (++batch == 512) {
 				exec("COMMIT");
 				const auto now = std::chrono::steady_clock::now();
 				if (now >= next_report) {
-					publish_stats(sql, state);
+					publish();
 					next_report = now + std::chrono::seconds(10);
 				}
 				exec("BEGIN");
@@ -721,12 +761,16 @@ public:
 		}
 		pending.reset();
 		exec("COMMIT");
-		publish_stats(sql, state);
-		std::cout << "dedup ranges=" << ranges << " kernel_bytes=" << bytes
+		publish();
+		std::cout << "dedup ranges=" << activity.matched_ranges << " kernel_bytes=" << bytes
 			<< " newly_shared_bytes=" << shared
-			<< " rejected=" << rejected << " last_status=" << last_error
+			<< " rejected=" << activity.rejected_ranges << " last_status=" << last_error
 			<< (stopping ? " interrupted" : "") << std::endl;
 	}
+
+	void idle(long interval) { phase("idle", interval); }
+
+	void finish() { phase("stopped"); }
 };
 
 string state_directory()
@@ -818,13 +862,15 @@ try {
 		if (!stopping) {
 			index.dedup();
 		}
-		if (once) {
+		if (once || stopping) {
 			break;
 		}
+		index.idle(interval);
 		for (long seconds = 0; seconds < interval && !stopping; ++seconds) {
 			std::this_thread::sleep_for(std::chrono::seconds(1));
 		}
 	}
+	index.finish();
 	return 0;
 } catch (const std::exception &error) {
 	std::cerr << "project-bees: " << error.what() << '\n';
