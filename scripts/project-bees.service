@@ -1,0 +1,14 @@
+[Unit]
+Description=Cross-repository Btrfs deduplication
+
+[Service]
+ExecStart=%h/.local/bin/project-bees
+Restart=on-failure
+RestartSec=15s
+Nice=19
+IOSchedulingClass=idle
+IOWeight=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

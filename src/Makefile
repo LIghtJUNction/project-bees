@@ -1,4 +1,5 @@
 BEES = ../bin/bees
+PROJECT_BEES = ../bin/project-bees
 
 all: $(BEES)
 
@@ -18,7 +19,7 @@ BEES_OBJS = \
 	bees-trace.o \
 	bees-types.o \
 
-ALL_OBJS = $(BEES_OBJS) $(PROGRAM_OBJS)
+ALL_OBJS = $(BEES_OBJS) project-bees.o $(PROGRAM_OBJS)
 
 bees-version.c: bees.h $(BEES_OBJS:.o=.cc) Makefile ../lib/libcrucible.a
 	echo "const char *BEES_VERSION = \"$(BEES_VERSION)\";" > bees-version.c.new
@@ -41,6 +42,12 @@ include $(ALL_OBJS:%.o=%.dep)
 
 $(BEES): $(BEES_OBJS) bees-version.o bees-usage.o ../lib/libcrucible.a
 	$(CXX) $(BEES_CXXFLAGS) $(BEES_LDFLAGS) -o $@ $^ $(LIBS)
+
+.PHONY: project-bees
+project-bees: $(PROJECT_BEES)
+
+$(PROJECT_BEES): project-bees.o ../lib/libcrucible.a
+	$(CXX) $(BEES_CXXFLAGS) $(BEES_LDFLAGS) -o $@ $^ $(LIBS) -lsqlite3
 
 clean:
 	rm -fv *.o bees-version.c

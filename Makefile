@@ -13,7 +13,7 @@ BEES_VERSION ?= $(shell git describe --always --dirty || echo UNKNOWN)
 # allow local configuration to override above variables
 -include localconf
 
-DEFAULT_MAKE_TARGET ?= reallyall
+DEFAULT_MAKE_TARGET ?= project-bees
 
 ifeq ($(DEFAULT_MAKE_TARGET),reallyall)
 	RUN_INSTALL_TESTS = test
@@ -29,7 +29,7 @@ reallyall: all doc test
 clean: ## Cleanup
 	git clean -dfx -e localconf
 
-.PHONY: lib src test doc
+.PHONY: lib src test doc project-bees test-project-bees install-project-bees install-user
 
 lib: ## Build libs
 	+$(MAKE) TAG="$(BEES_VERSION)" -C lib
@@ -37,6 +37,12 @@ lib: ## Build libs
 src: ## Build bins
 src: lib
 	+$(MAKE) BEES_VERSION="$(BEES_VERSION)" -C src
+
+project-bees: lib ## Build the Git repository deduplication daemon
+	+$(MAKE) -C src project-bees
+
+test-project-bees: project-bees ## Test repository discovery and deduplication on Btrfs
+	python3 test/project-bees.py
 
 test: ## Run tests
 test: lib src
@@ -62,8 +68,14 @@ ifneq ($(SYSTEMD_SYSTEM_UNIT_DIR),)
 	install -Dm644 scripts/beesd@.service $(DESTDIR)$(SYSTEMD_SYSTEM_UNIT_DIR)/beesd@.service
 endif
 
-install: ## Install distribution
-install: install_bees install_scripts
+install: install-project-bees
+
+install-project-bees: project-bees ## Install project-bees
+	install -Dm755 bin/project-bees $(DESTDIR)$(PREFIX)/bin/project-bees
+
+install-user: project-bees ## Install the executable and user systemd unit
+	install -Dm755 bin/project-bees "$(HOME)/.local/bin/project-bees"
+	install -Dm644 scripts/project-bees.service "$${XDG_CONFIG_HOME:-$(HOME)/.config}/systemd/user/project-bees.service"
 
 help: ## Show help
 	@fgrep -h "##" $(MAKEFILE_LIST) | fgrep -v fgrep | sed -e 's/\\$$//' | sed -e 's/##/\t/'
