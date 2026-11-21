@@ -429,6 +429,72 @@ def test_coalesced_hash_collision(root):
     print("Passed collision rejection and single-chunk fallback after a failed merged range")
 
 
+def test_first_source_cache_fallback(root):
+    scan, state, (a, b) = make_repositories(root, "first-source-cache-collision")
+    put(a / "one", os.urandom(CHUNK_SIZE))
+    put(a / "two", os.urandom(CHUNK_SIZE))
+    run_once(scan, state, 0)
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        rows = list(db.execute(
+            "SELECT f.path,f.id,c.hash FROM files f JOIN chunks c ON c.file=f.id ORDER BY f.id,c.start"
+        ))
+        assert len(rows) == 2, rows
+        bad, good = (Path(os.fsdecode(row[0])) for row in rows)
+        # Choose by the actual index order, independent of filesystem traversal.
+        assert db.execute(
+            "UPDATE chunks SET hash=? WHERE file=? AND start=0", (rows[1][2], rows[0][1]),
+        ).rowcount == 1
+    content = good.read_bytes()
+    assert bad.read_bytes() != content
+    destinations = [put(b / f"copy-{index}", content) for index in range(2)]
+    before = {path: digest(path) for path in (bad, good, *destinations)}
+    report = run_once(scan, state, 2 * CHUNK_SIZE)
+    # The bad original rejects both B copies; each B copy then rejects the
+    # original first row exactly once and falls back to the valid second row.
+    # Caching the last successful source, or retrying the cached row twice,
+    # changes this count despite leaving equal contents superficially intact.
+    assert report["activity"]["rejectedRanges"] == 4, report
+    assert report["activity"]["matchedRanges"] == 3, report
+    for path in destinations:
+        assert shared_range(good, 0, path, 0, CHUNK_SIZE), (path, report)
+    assert all((extent[5] & FIEMAP_EXTENT_SHARED) == 0 for extent in extents(bad))
+    assert before == {path: digest(path) for path in before}
+
+    scan, state, (valid_repo, target_repo) = make_repositories(root, "first-source-cache-invalid")
+    content = os.urandom(CHUNK_SIZE)
+    original = put(scan / "document", content)
+    backup = put(scan / "document.bak", content)
+    run_once(scan, state, CHUNK_SIZE)
+    valid = put(valid_repo / "valid-source", content)
+    run_once(scan, state, 2 * CHUNK_SIZE)
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        identities = dict(db.execute("SELECT path,id FROM files"))
+        assert max(identities[os.fsencode(path)] for path in (original, backup)) < identities[os.fsencode(valid)]
+    os.link(backup, root / "first-source-cache-witness-hardlink")
+    destinations = [put(target_repo / f"copy-{index}", content) for index in range(2)]
+    before = {path: digest(path) for path in (original, backup, valid, *destinations)}
+    lines = []
+    report = run_once(scan, state, 4 * CHUNK_SIZE, priority_roots=(target_repo,), output=lines)
+    # Both earlier indexed rows are now ineligible, but their stale entries
+    # remain until the full pass. A cache hit must still revalidate and fall
+    # through to the later valid source during the priority pass itself.
+    early = [line for line in lines[:lines.index("full scan")] if line.startswith("dedup ranges=")]
+    assert len(early) == 1 and "dedup ranges=2 " in early[0], lines
+    assert f"newly_shared_bytes={2 * CHUNK_SIZE} " in early[0], lines
+    events = report["recentEvents"]
+    assert len(events) == 2 and {event["source"] for event in events} == {str(valid)}, events
+    assert {event["destination"] for event in events} == {str(path) for path in destinations}, events
+    assert sum(event["bytes"] for event in events) == 2 * CHUNK_SIZE, events
+    for path in destinations:
+        assert shared_range(valid, 0, path, 0, CHUNK_SIZE), (path, report)
+    assert before == {path: digest(path) for path in before}
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert {row[0] for row in db.execute("SELECT path FROM files")} == {
+            os.fsencode(path) for path in (valid, *destinations)
+        }
+    print("Passed first-source cache hits with collision rejection and invalid-source fallback")
+
+
 def test_nontransitive_pending(root):
     scan, state, (a, b) = make_repositories(root, "pending-snapshot")
     x, y = (os.urandom(CHUNK_SIZE) for _ in range(2))
@@ -530,6 +596,58 @@ def test_completed_scan_pruning(root):
     assert digest(added) == added_digest
     assert digest(hardlink) == before[a / "two"]
     print("Passed completed-scan pruning, unchanged-file retention, and subsequent incremental indexing")
+
+
+def test_scope_change_reuses_hashes(root):
+    scan, state, (project,) = make_repositories(root, "scope-change-reuse", names=("project",))
+    nested = project / "component"
+    nested.mkdir()
+    content = os.urandom(CHUNK_SIZE)
+    source = put(project / "common", content)
+    dest = put(nested / "common", content)
+    run_once(scan, state, 0)
+    assert not shared_range(source, 0, dest, 0, CHUNK_SIZE)
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        identities = dict(db.execute("SELECT path,id FROM files"))
+        chunks = list(db.execute("SELECT file,start,length,hash FROM chunks ORDER BY file,start"))
+        stamps = list(db.execute(
+            "SELECT path,fsid,device,inode,size,msec,mnsec,csec,cnsec FROM files ORDER BY path"
+        ))
+    # Adding a nested repository changes only ownership of an existing file.
+    # Reused hashes must still wake the old scope and discover this new sharing.
+    git("init", "-q", f"--template={root / 'empty-template'}", nested)
+    report = run_once(scan, state, CHUNK_SIZE)
+    activity = report["activity"]
+    assert activity["scannedFiles"] == activity["processedFiles"] == 2, report
+    assert activity["hashedFiles"] == activity["indexedChunks"] == 0, report
+    assert shared_range(source, 0, dest, 0, CHUNK_SIZE), report
+    assert source.read_bytes() == dest.read_bytes() == content
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert dict(db.execute("SELECT path,id FROM files")) == identities
+        assert list(db.execute("SELECT file,start,length,hash FROM chunks ORDER BY file,start")) == chunks
+        assert list(db.execute(
+            "SELECT path,fsid,device,inode,size,msec,mnsec,csec,cnsec FROM files ORDER BY path"
+        )) == stamps
+        assert set(db.execute("SELECT path,root FROM files")) == {
+            (os.fsencode(source), os.fsencode(project)), (os.fsencode(dest), os.fsencode(nested)),
+        }
+        nested_stat = nested.stat()
+        assert db.execute("SELECT repo,pending FROM files WHERE path=?", (os.fsencode(dest),)).fetchone() == (
+            f"{nested_stat.st_dev}/{nested_stat.st_ino}".encode(), 0,
+        )
+
+    # An actual rewrite must still read and replace its hash even if mtime is restored.
+    previous = dest.stat()
+    changed = os.urandom(CHUNK_SIZE)
+    put(dest, changed)
+    os.utime(dest, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+    assert dest.stat().st_ctime_ns != previous.st_ctime_ns
+    repeated = run_once(scan, state, CHUNK_SIZE)
+    assert repeated["activity"]["hashedFiles"] == repeated["activity"]["indexedChunks"] == 1, repeated
+    assert repeated["recentEvents"] == [], repeated
+    assert source.read_bytes() == content and dest.read_bytes() == changed
+    assert not shared_range(source, 0, dest, 0, CHUNK_SIZE)
+    print("Passed scope-only hash reuse, unchanged index rows, fresh wake-up, and rewrite invalidation")
 
 
 def test_artifact_discovery(root):
@@ -1112,6 +1230,350 @@ def test_recent_events_limit(root):
     print("Passed bounded recent events while preserving cumulative sharing and per-file identity")
 
 
+def managed_environment(home):
+    env = os.environ.copy()
+    for key in (
+        "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "CARGO_HOME",
+        "MISE_DATA_DIR", "MISE_INSTALLS_DIR", "MISE_DOWNLOADS_DIR", "UV_PYTHON_INSTALL_DIR",
+        "NVM_DIR", "PYENV_ROOT", "RBENV_ROOT", "SDKMAN_DIR", "ASDF_DATA_DIR",
+    ):
+        env.pop(key, None)
+    env["HOME"] = str(home)
+    return env
+
+
+def test_managed_installations(root):
+    scan = root / "managed-installations"
+    home = scan / "home"
+    home.mkdir(parents=True)
+    env = managed_environment(home)
+    mise = home / ".local/share/mise"
+    template = root / "empty-template"
+    template.mkdir(exist_ok=True)
+    for manager in (mise, home / ".nvm", home / ".pyenv", home / ".rbenv", home / ".asdf"):
+        git("init", "-q", f"--template={template}", manager)
+    layouts = (
+        (mise / "installs", 2), (mise / "downloads", 2),
+        (home / ".local/share/uv/python", 1), (home / ".nvm/versions/node", 1),
+        (home / ".pyenv/versions", 1), (home / ".rbenv/versions", 1),
+        (home / ".sdkman/candidates", 2), (home / ".asdf/installs", 2),
+        (home / ".asdf/downloads", 2),
+    )
+    state = mise / "installs/.bees-state"
+    state.mkdir(parents=True)
+    members, pairs = {}, []
+    for container, depth in layouts:
+        container.mkdir(parents=True, exist_ok=True)
+        (container / "README.md").write_text("Managed installations.\n")
+        content = os.urandom(CHUNK_SIZE)
+        pair = []
+        for version in ("1.0", "2.0"):
+            scope = (container / "tool" if depth == 2 else container) / version
+            member = scope / "bin/common"
+            member.parent.mkdir(parents=True)
+            (scope / "README.md").write_text("Installed version.\n")
+            members[put(member, content)] = scope
+            pair.append(member)
+        pairs.append((*pair, content))
+    first_version = members[pairs[0][0]]
+    same_content = os.urandom(CHUNK_SIZE)
+    same = []
+    for relative in ("docs/same", "lib/node_modules/package/same"):
+        path = first_version / relative
+        path.parent.mkdir(parents=True)
+        (path.parent / "README.md").write_text("Nested documentation.\n")
+        members[put(path, same_content)] = first_version
+        same.append(path)
+    uv = layouts[2][0]
+    temporary = uv / ".temp/work/payload"
+    temporary.parent.mkdir(parents=True)
+    members[put(temporary, os.urandom(CHUNK_SIZE))] = uv
+    alias = layouts[3][0] / "current"
+    alias.symlink_to(members[pairs[3][0]], target_is_directory=True)
+    hard = put(first_version / "hard", os.urandom(CHUNK_SIZE))
+    os.link(hard, first_version / "hard-copy")
+    ordinary = scan / "ordinary/versions/1.0"
+    ordinary.mkdir(parents=True)
+    excluded = put(ordinary / "common", pairs[0][2])
+    ignored = put(state / "do-not-index", pairs[0][2])
+    discovered = set(discover(scan, state, env=env))
+    assert {str(scope) for scope in members.values()} <= discovered, discovered
+    assert not {str(alias), str(uv / ".temp"), str(temporary.parent), str(state)} & discovered, discovered
+    report = run_once(scan, state, len(layouts) * CHUNK_SIZE, env=env)
+    for first, second, content in pairs:
+        assert first.read_bytes() == second.read_bytes() == content
+        assert shared_range(first, 0, second, 0, CHUNK_SIZE), (first, report)
+    assert same[0].read_bytes() == same[1].read_bytes() == same_content
+    assert not shared_range(same[0], 0, same[1], 0, CHUNK_SIZE)
+    for path in (excluded, ignored):
+        assert path.read_bytes() == pairs[0][2]
+        assert all((extent[5] & FIEMAP_EXTENT_SHARED) == 0 for extent in extents(path)), path
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert set(db.execute("SELECT path,root FROM files")) == {
+            (os.fsencode(path), os.fsencode(scope)) for path, scope in members.items()
+        }
+    repeated = run_once(scan, state, len(layouts) * CHUNK_SIZE, env=env)
+    assert repeated["activity"]["hashedFiles"] == 0, repeated
+    print("Passed managed tool/version boundaries, manager Git ownership, hidden metadata, and repeat scans")
+
+
+def test_managed_environment_roots(root):
+    scan = root / "managed-environment"
+    home = scan / "home"
+    home.mkdir(parents=True)
+    state = root / "managed-environment-state"
+    env = managed_environment(home)
+    for key, name in (
+        ("MISE_DATA_DIR", "mise-data"), ("MISE_INSTALLS_DIR", "mise-installed"),
+        ("UV_PYTHON_INSTALL_DIR", "uv-python"), ("NVM_DIR", "node-manager"),
+        ("PYENV_ROOT", "python-manager"), ("RBENV_ROOT", "ruby-manager"),
+        ("SDKMAN_DIR", "sdk-manager"), ("ASDF_DATA_DIR", "asdf-data"), ("CARGO_HOME", "cargo-data"),
+    ):
+        env[key] = str(scan / name)
+    env["MISE_DOWNLOADS_DIR"] = "relative-downloads"
+    layouts = (
+        (Path(env["MISE_INSTALLS_DIR"]), 2), (Path(env["MISE_DATA_DIR"]) / "downloads", 2),
+        (Path(env["UV_PYTHON_INSTALL_DIR"]), 1), (Path(env["NVM_DIR"]) / "versions/node", 1),
+        (Path(env["PYENV_ROOT"]) / "versions", 1), (Path(env["RBENV_ROOT"]) / "versions", 1),
+        (Path(env["SDKMAN_DIR"]) / "candidates", 2),
+        (Path(env["ASDF_DATA_DIR"]) / "installs", 2), (Path(env["ASDF_DATA_DIR"]) / "downloads", 2),
+    )
+    content = os.urandom(CHUNK_SIZE)
+    members = {}
+    for container, depth in layouts:
+        for name in ("1.0", "2.0"):
+            scope = (container / "tool" if depth == 2 else container) / name
+            scope.mkdir(parents=True)
+            members[put(scope / "common", content)] = scope
+    cargo_bin = Path(env["CARGO_HOME"]) / "bin"
+    cargo_bin.mkdir(parents=True)
+    for name in ("one", "two"):
+        path = put(cargo_bin / name, content)
+        members[path] = path
+    report = run_once(scan, state, (len(members) - 1) * CHUNK_SIZE, env=env)
+    reference = next(iter(members))
+    for path in members:
+        assert path.read_bytes() == content
+        assert shared_range(reference, 0, path, 0, CHUNK_SIZE), (path, report)
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert set(db.execute("SELECT path,root FROM files")) == {
+            (os.fsencode(path), os.fsencode(scope)) for path, scope in members.items()
+        }
+    # Invalid relative overrides use the documented absolute fallback.
+    config = scan / "config"
+    env["NVM_DIR"] = "relative-nvm"
+    env["XDG_CONFIG_HOME"] = str(config)
+    fallback = []
+    for version in ("1.0", "2.0"):
+        scope = config / "nvm/versions/node" / version
+        scope.mkdir(parents=True)
+        fallback.append(put(scope / "common", content))
+    limited_state = root / "managed-environment-limited-state"
+    run_once(config, limited_state, CHUNK_SIZE, env=env)
+    assert shared_range(fallback[0], 0, fallback[1], 0, CHUNK_SIZE)
+    with sqlite3.connect(limited_state / "index.sqlite3") as db:
+        assert set(db.execute("SELECT path,root FROM files")) == {
+            (os.fsencode(path), os.fsencode(path.parent)) for path in fallback
+        }
+    print("Passed absolute manager overrides, relative fallback, and bounded XDG nvm discovery")
+
+
+def test_managed_priority_migration(root):
+    scan = root / "managed-migration"
+    home = scan / "home"
+    home.mkdir(parents=True)
+    env = managed_environment(home)
+    state = root / "managed-migration-state"
+    manager = home / ".nvm"
+    template = root / "empty-template"
+    template.mkdir(exist_ok=True)
+    git("init", "-q", f"--template={template}", manager)
+    version = manager / "versions/node/1.0"
+    artifact = version / "lib/node_modules"
+    (artifact / "package").mkdir(parents=True)
+    contents = [os.urandom(CHUNK_SIZE) for _ in range(3)]
+    old = [put(version / "old", contents[0]), put(artifact / "package/old", contents[1]),
+           put(version / "document", contents[2])]
+    backup = put(version / "document.bak", os.urandom(CHUNK_SIZE))
+    run_once(scan, state, 0, env=env)
+
+    def identity(path):
+        st = path.stat()
+        return f"{st.st_dev}/{st.st_ino}"
+
+    # Model all three ownership forms kept by previous releases. Their hashes
+    # and file stamps remain valid, so only scope revalidation can reject them.
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        for path, owner, key in (
+            (old[0], manager, identity(manager)),
+            (old[1], artifact, identity(artifact)),
+            (old[2], old[2], identity(old[2]) + ":document.bak"),
+        ):
+            assert db.execute(
+                "UPDATE files SET root=?,repo=?,pending=0 WHERE path=?",
+                (os.fsencode(owner), os.fsencode(key), os.fsencode(path)),
+            ).rowcount == 1
+    priority = version / "bin"
+    priority.mkdir()
+    fresh = [put(priority / f"new-{index}", content) for index, content in enumerate(contents)]
+    lines = []
+    report = run_once(scan, state, 0, env=env, priority_roots=(priority,), output=lines)
+    assert lines.index(f"priority scan root={priority}") < lines.index("full scan"), lines
+    assert report["pairs"] == report["recentEvents"] == [], report
+    for original, destination, content in zip(old, fresh, contents):
+        assert original.read_bytes() == destination.read_bytes() == content
+        assert not shared_range(original, 0, destination, 0, CHUNK_SIZE), (original, report)
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert set(db.execute("SELECT path,root FROM files")) == {
+            *((os.fsencode(path), os.fsencode(version)) for path in (*old, *fresh)),
+            (os.fsencode(backup), os.fsencode(backup)),
+        }
+
+    second = manager / "versions/node/2.0"
+    second.mkdir()
+    references = [put(second / f"common-{index}", content) for index, content in enumerate(contents)]
+    report = run_once(scan, state, 6 * CHUNK_SIZE, env=env)
+    for original, destination, reference, content in zip(old, fresh, references, contents):
+        assert original.read_bytes() == destination.read_bytes() == reference.read_bytes() == content
+        assert shared_range(original, 0, reference, 0, CHUNK_SIZE), report
+        assert shared_range(destination, 0, reference, 0, CHUNK_SIZE), report
+
+    # Genuine nested Git, named backups, and an artifact inside backup storage
+    # stay independent, including when they are sources outside the priority pass.
+    embedded = version / "embedded"
+    git("init", "-q", f"--template={template}", embedded)
+    backup_artifact = version / "Backups/snapshot/node_modules"
+    backup_artifact.mkdir(parents=True)
+    sources = []
+    for path in (embedded / "common", version / "extra.bak", backup_artifact / "common"):
+        content = os.urandom(CHUNK_SIZE)
+        sources.append((put(path, content), content))
+    run_once(scan, state, 6 * CHUNK_SIZE, env=env)
+    destinations = [put(priority / f"independent-{index}", content)
+                    for index, (_, content) in enumerate(sources)]
+    report = run_once(scan, state, 9 * CHUNK_SIZE, env=env, priority_roots=(priority,))
+    for (source, content), destination in zip(sources, destinations):
+        assert source.read_bytes() == destination.read_bytes() == content
+        assert shared_range(source, 0, destination, 0, CHUNK_SIZE), (source, report)
+
+    # A caller can still start a local traversal directly at a deep artifact.
+    # Its version owner lies outside that explicit boundary and is not inherited.
+    external = scan / "external"
+    git("init", "-q", f"--template={template}", external)
+    local_content = os.urandom(CHUNK_SIZE)
+    local = put(artifact / "package/local", local_content)
+    external_file = put(external / "common", local_content)
+    outside = put(version / "outside-local-root", local_content)
+    local_state = root / "managed-local-root-state"
+    process = subprocess.run(
+        [BINARY, "--root", artifact, "--root", external, "--state-dir", local_state, "--once"],
+        text=True, capture_output=True, env=env,
+    )
+    assert process.returncode == 0, process.stdout + process.stderr
+    local_report = json.loads((local_state / "stats.json").read_text())
+    check_activity(local_report, "stopped")
+    assert local_report["totalBytes"] == CHUNK_SIZE, (local_report, process.stdout)
+    assert local.read_bytes() == external_file.read_bytes() == outside.read_bytes() == local_content
+    assert shared_range(local, 0, external_file, 0, CHUNK_SIZE)
+    assert not shared_range(local, 0, outside, 0, CHUNK_SIZE)
+    with sqlite3.connect(local_state / "index.sqlite3") as db:
+        assert dict(db.execute("SELECT path,root FROM files"))[os.fsencode(local)] == os.fsencode(artifact)
+        assert db.execute("SELECT count(*) FROM files WHERE path=?", (os.fsencode(outside),)).fetchone()[0] == 0
+    print("Passed partial migration of ancestor, artifact, and original-file owners with local-root semantics")
+
+
+def test_user_application_scopes(root):
+    home = root / "user-application-home"
+    home.mkdir()
+    env = managed_environment(home)
+    state = home / ".local" / "state" / "project-bees"
+    state.mkdir(parents=True)
+    content = os.urandom(CHUNK_SIZE)
+    members = {}
+    file_containers = (
+        home / ".local" / "bin",
+        home / ".cargo" / "bin",
+        home / ".local" / "share" / "claude" / "versions",
+    )
+    for container in file_containers:
+        container.mkdir(parents=True)
+        for name in ("tool-one", "tool-two"):
+            member = put(container / name, content)
+            members[member] = member
+    for name in ("org.example.One", "org.example.Two"):
+        scope = home / ".var" / "app" / name
+        member = scope / "cache" / "nested" / "common"
+        member.parent.mkdir(parents=True)
+        members[put(member, content)] = scope
+
+    excluded = [put(state / "do-not-index", content)]
+    for parent in (
+        file_containers[0] / "ordinary" / "nested",
+        file_containers[1] / "ordinary" / "nested",
+        home / ".var" / "ordinary",
+        home / "ordinary",
+    ):
+        parent.mkdir(parents=True)
+        excluded.append(put(parent / "common", content))
+    symlink = file_containers[0] / "linked-tool"
+    symlink.symlink_to(excluded[-1])
+    hardlink = put(file_containers[0] / "linked-inode-one", content)
+    second_link = file_containers[1] / "linked-inode-two"
+    os.link(hardlink, second_link)
+    excluded.extend((hardlink, second_link))
+
+    discovered = set(discover(home, state, env=env))
+    assert {str(scope) for scope in members.values()} <= discovered, discovered
+    expected = (len(members) - 1) * CHUNK_SIZE
+    report = run_once(home, state, expected, env=env)
+    assert report["activity"]["hashedFiles"] == len(members), report
+    reference = next(iter(members))
+    for path in members:
+        assert path.read_bytes() == content
+        assert shared_range(reference, 0, path, 0, CHUNK_SIZE), (path, report)
+    for path in excluded:
+        assert path.read_bytes() == content
+        assert all((extent[5] & FIEMAP_EXTENT_SHARED) == 0 for extent in extents(path)), path
+    assert symlink.is_symlink() and symlink.read_bytes() == content
+    assert hardlink.stat().st_nlink == second_link.stat().st_nlink == 2
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert set(db.execute("SELECT path,root FROM files")) == {
+            (os.fsencode(path), os.fsencode(scope)) for path, scope in members.items()
+        }
+
+    # A narrowed scan must not borrow an old source beyond its explicit root,
+    # even during the early pass before the full scan prunes that old record.
+    later = os.urandom(CHUNK_SIZE)
+    outside = put(file_containers[1] / "outside-source", later)
+    indexed = run_once(home, state, expected, env=env)
+    assert indexed["rangeCount"] == report["rangeCount"], indexed
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert db.execute("SELECT root FROM files WHERE path=?", (os.fsencode(outside),)).fetchone() == (
+            os.fsencode(outside),
+        )
+    inside = put(file_containers[2] / "inside-destination", later)
+    lines = []
+    bounded = run_once(
+        file_containers[2], state, expected, env=env,
+        priority_roots=(file_containers[2], file_containers[1]), output=lines,
+    )
+    assert f"priority scan root={file_containers[2]}" in lines, lines
+    assert f"priority scan root={file_containers[1]}" not in lines, lines
+    assert bounded["recentEvents"] == [], bounded
+    assert bounded["rangeCount"] == report["rangeCount"], bounded
+    retained = {path for path in members if path.parent == file_containers[2]} | {inside}
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert set(db.execute("SELECT path,root FROM files")) == {
+            (os.fsencode(path), os.fsencode(path)) for path in retained
+        }
+    for path in (inside, outside):
+        assert path.read_bytes() == later
+        assert all((extent[5] & FIEMAP_EXTENT_SHARED) == 0 for extent in extents(path)), path
+    for path in members:
+        assert path.read_bytes() == content
+    print("Passed direct user executable scopes, application ownership, links, state exclusion, and explicit-root bounds")
+
+
 if __name__ == "__main__":
     test_parent = Path(os.environ.get("PROJECT_BEES_TEST_DIR", BINARY.parents[1])).resolve()
     fstype = subprocess.check_output(["stat", "-f", "-c", "%T", test_parent], text=True).strip()
@@ -1123,10 +1585,12 @@ if __name__ == "__main__":
         test_coalesced_ranges(Path(directory))
         test_shifted_and_sparse_ranges(Path(directory))
         test_coalesced_hash_collision(Path(directory))
+        test_first_source_cache_fallback(Path(directory))
         test_nontransitive_pending(Path(directory))
         test_repeated_block_convergence(Path(directory))
         test_cross_file_source_convergence(Path(directory))
         test_completed_scan_pruning(Path(directory))
+        test_scope_change_reuses_hashes(Path(directory))
         test_artifact_discovery(Path(directory))
         test_language_artifact_discovery(Path(directory))
         test_xdg_storage_containers(Path(directory))
@@ -1138,3 +1602,7 @@ if __name__ == "__main__":
         test_readme_discovery(Path(directory))
         test_opt_storage(Path(directory))
         test_recent_events_limit(Path(directory))
+        test_managed_installations(Path(directory))
+        test_managed_environment_roots(Path(directory))
+        test_managed_priority_migration(Path(directory))
+        test_user_application_scopes(Path(directory))

@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <mntent.h>
+#include <optional>
 #include <set>
 #include <sqlite3.h>
 #include <stdexcept>
@@ -27,6 +28,7 @@
 #include <sys/file.h>
 #include <sys/vfs.h>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -376,6 +378,14 @@ string child_directory(const string &parent, const char *child)
 	return parent.empty() ? string() : (fs::path(parent) / child).string();
 }
 
+std::string_view parent_directory(std::string_view path)
+{
+	const auto slash = path.find_last_of('/');
+	return slash == path.npos ? std::string_view() : path.substr(0, slash ? slash : 1);
+}
+
+enum class ManagedScope { none, container, version };
+
 class ScanPolicy {
 	struct Marker {
 		string identity;
@@ -384,7 +394,19 @@ class ScanPolicy {
 	std::vector<string> priority;
 	std::set<string, std::less<>> storage;
 	std::set<string, std::less<>> containers;
+	std::map<string, unsigned, std::less<>> managed;
+	std::set<string, std::less<>> file_containers;
+	std::set<string, std::less<>> limits;
 	mutable std::map<string, Marker, std::less<>> markers;
+	mutable std::set<string, std::less<>> observed_scopes;
+	mutable std::set<string, std::less<>> rejected_scopes;
+
+	void prioritize(const string &path)
+	{
+		if (std::find(priority.begin(), priority.end(), path) == priority.end()) {
+			priority.push_back(path);
+		}
+	}
 
 	void add(const string &path, bool container = true)
 	{
@@ -394,13 +416,47 @@ class ScanPolicy {
 				containers.insert(normalized);
 			}
 			if (storage.insert(normalized).second) {
-				priority.push_back(std::move(normalized));
+				prioritize(normalized);
 			}
 		}
 	}
 
+	void add_managed(const string &path, unsigned depth)
+	{
+		const auto normalized = absolute_directory(path);
+		if (!normalized.empty()) {
+			managed[normalized] = depth;
+			prioritize(normalized);
+		}
+	}
+
+	void add_files(const string &path)
+	{
+		const auto normalized = absolute_directory(path);
+		if (!normalized.empty()) {
+			file_containers.insert(normalized);
+			prioritize(normalized);
+		}
+	}
+
+	static std::string_view managed_boundary(std::string_view directory, std::string_view base, unsigned depth)
+	{
+		auto end = base.size();
+		for (unsigned level = 0; level < depth && end < directory.size(); ++level) {
+			const auto start = end + (end == 1 ? 0 : 1);
+			// Manager metadata and temporary directories are not installed versions.
+			if (directory[start] == '.') {
+				break;
+			}
+			const auto slash = directory.find('/', start);
+			end = slash == directory.npos ? directory.size() : slash;
+		}
+		return directory.substr(0, end);
+	}
+
 public:
-	explicit ScanPolicy(const std::vector<string> &extra_priority_roots = {})
+	explicit ScanPolicy(const std::vector<string> &extra_priority_roots = {}, const std::vector<string> &roots = {})
+		: limits(roots.begin(), roots.end())
 	{
 		for (const auto &path : extra_priority_roots) {
 			add(fs::absolute(path).string(), false);
@@ -414,6 +470,24 @@ public:
 		const auto rustup = environment_directory("RUSTUP_HOME", child_directory(home, ".rustup"));
 		const auto gradle = environment_directory("GRADLE_USER_HOME", child_directory(home, ".gradle"));
 		const auto bundle = environment_directory("BUNDLE_USER_HOME", child_directory(home, ".bundle"));
+		const auto mise = environment_directory("MISE_DATA_DIR", child_directory(data, "mise"));
+		const auto asdf = environment_directory("ASDF_DATA_DIR", child_directory(home, ".asdf"));
+		const auto nvm_config = environment_directory("XDG_CONFIG_HOME", {});
+		const auto nvm = environment_directory("NVM_DIR", nvm_config.empty() ?
+			child_directory(home, ".nvm") : child_directory(nvm_config, "nvm"));
+		add_managed(environment_directory("MISE_INSTALLS_DIR", child_directory(mise, "installs")), 2);
+		add_managed(environment_directory("MISE_DOWNLOADS_DIR", child_directory(mise, "downloads")), 2);
+		add_managed(environment_directory("UV_PYTHON_INSTALL_DIR", child_directory(data, "uv/python")), 1);
+		add_managed(child_directory(nvm, "versions/node"), 1);
+		add_managed(child_directory(environment_directory("PYENV_ROOT", child_directory(home, ".pyenv")), "versions"), 1);
+		add_managed(child_directory(environment_directory("RBENV_ROOT", child_directory(home, ".rbenv")), "versions"), 1);
+		add_managed(child_directory(environment_directory("SDKMAN_DIR", child_directory(home, ".sdkman")), "candidates"), 2);
+		add_managed(child_directory(asdf, "installs"), 2);
+		add_managed(child_directory(asdf, "downloads"), 2);
+		add_files(child_directory(home, ".local/bin"));
+		add_files(child_directory(cargo, "bin"));
+		add_files(child_directory(data, "claude/versions"));
+		add(child_directory(home, ".var/app"));
 		add("/var/tmp");
 		add("/var/backups");
 		add(child_directory(home, "Backups"));
@@ -476,15 +550,79 @@ public:
 
 	bool storage_scope(const string &path) const
 	{
-		const std::string_view view(path);
-		const auto slash = view.find_last_of('/');
-		const auto parent = slash == view.npos ? std::string_view() : view.substr(0, slash ? slash : 1);
-		return storage.count(view) || storage.count(parent);
+		return storage.count(path) || storage.count(parent_directory(path));
 	}
 
 	bool storage_container(const string &path) const { return containers.count(path); }
 
-	void begin_scan() const { markers.clear(); }
+	ManagedScope managed_scope(const string &path) const
+	{
+		std::string_view ancestor(path);
+		for (unsigned distance = 0; distance <= 2 && !ancestor.empty(); ++distance) {
+			const auto found = managed.find(ancestor);
+			if (found != managed.end()) {
+				if (managed_boundary(path, ancestor, found->second).size() != path.size()) {
+					return ManagedScope::none;
+				}
+				return distance < found->second ? ManagedScope::container :
+					distance == found->second ? ManagedScope::version : ManagedScope::none;
+			}
+			if (ancestor == "/") {
+				break;
+			}
+			ancestor = parent_directory(ancestor);
+		}
+		return ManagedScope::none;
+	}
+
+	bool file_scope(const string &path) const { return file_containers.count(parent_directory(path)); }
+
+	bool allowed_path(const string &path) const
+	{
+		return limits.empty() || std::any_of(limits.begin(), limits.end(),
+			[&](const auto &root) { return within(path, root); });
+	}
+
+	string scope_boundary(const string &path, const Mounts &mounts) const
+	{
+		if (file_scope(path)) {
+			return path;
+		}
+		const auto parent = parent_directory(path);
+		auto ancestor = parent;
+		while (!ancestor.empty()) {
+			const auto found = managed.find(ancestor);
+			if (found != managed.end()) {
+				const auto boundary = managed_boundary(parent, ancestor, found->second);
+				// A local --root or a separate mount starts a new traversal and does
+				// not inherit the version owner outside that traversal's boundary.
+				for (auto entry = parent; entry.size() > boundary.size(); entry = parent_directory(entry)) {
+					const auto mount = mounts.find(string(entry));
+					if (limits.count(entry) || (mount != mounts.end() && mount->second)) {
+						return string(entry);
+					}
+				}
+				return string(boundary);
+			}
+			if (ancestor == "/") {
+				break;
+			}
+			ancestor = parent_directory(ancestor);
+		}
+		return {};
+	}
+
+	void observe_scope(const string &path) const { observed_scopes.insert(path); }
+	bool observed_scope(const string &path) const { return observed_scopes.count(path); }
+	void reject_scope(const string &path) const { rejected_scopes.insert(path); }
+	bool rejected_scope(const string &path) const { return rejected_scopes.count(path); }
+
+	void begin_scan() const
+	{
+		markers.clear();
+		observed_scopes.clear();
+		rejected_scopes.clear();
+	}
 
 	bool artifact_scope(const string &path, int dir, const struct stat &st, const string *readme = nullptr) const
 	{
@@ -681,18 +819,22 @@ void select_scope(const string &path, int dir, const struct stat &st, const Scan
 	if (scope.metadata && !backup) {
 		return;
 	}
+	const auto managed = policy.managed_scope(path);
 	const bool git = !scope.metadata && git_repository(dir);
 	// A README describing a known cache/application container must not collapse
 	// its application scopes. Explicit project priorities retain normal markers.
-	const bool artifact = !git && !backup && (!scope.repo || scope.storage) &&
+	const bool artifact = managed == ManagedScope::none && !git && !backup && (!scope.repo || scope.storage) &&
 		policy.artifact_scope(path, dir, st, readme);
-	const bool storage = !git && !backup && !artifact && (!scope.repo || scope.storage) &&
+	const bool storage = managed == ManagedScope::none && !git && !backup && !artifact && (!scope.repo || scope.storage) &&
 		(policy.storage_scope(path) || backup_storage_scope(path));
-	const bool paired = !git && !backup && !artifact && !storage && (!scope.repo || scope.storage) && !original.empty();
-	if (git || backup || artifact || storage || paired) {
+	const bool paired = managed == ManagedScope::none && !git && !backup && !artifact && !storage &&
+		(!scope.repo || scope.storage) && !original.empty();
+	if (managed != ManagedScope::none || git || backup || artifact || storage || paired) {
 		if (auto selected = make_scope(path, dir, st, paired ? original : string())) {
 			scope.repo = std::move(selected);
-			scope.storage = storage || (!git && backup_container(name));
+			// Only exact manager installation boundaries override an enclosing project.
+			// Their version directories own their nested build/dependency directories.
+			scope.storage = managed == ManagedScope::container || storage || (!git && backup_container(name));
 			if (backup) {
 				scope.metadata = false;
 			}
@@ -808,6 +950,7 @@ void walk(const std::vector<string> &requested, const string &state, const ScanP
 				}
 				select_scope(path, dir, st, policy, scope, original, &children.readme);
 				if (scope.repo && (scope.repo != previous || !level)) {
+					policy.observe_scope(scope.repo->path);
 					found(*scope.repo);
 				}
 				scopes.push_back(std::move(scope));
@@ -817,15 +960,17 @@ void walk(const std::vector<string> &requested, const string &state, const ScanP
 				auto repo = scopes[level - 1].repo;
 				const auto original = names[level - 1].originals.find(entry->fts_name);
 				const bool backup = backup_name(entry->fts_name);
-				if (!repo && !backup && original == names[level - 1].originals.end()) {
+				const bool independent = policy.file_scope(entry->fts_path);
+				if (!repo && !backup && !independent && original == names[level - 1].originals.end()) {
 					continue;
 				}
 				struct stat st {};
 				if (!mounts.count(entry->fts_path) && lstat(entry->fts_path, &st) == 0 && S_ISREG(st.st_mode)) {
-					if (st.st_nlink == 1 && (backup || (!repo && original != names[level - 1].originals.end()))) {
+					if (st.st_nlink == 1 && (backup || independent || (!repo && original != names[level - 1].originals.end()))) {
 						const Fd fd = open_path(entry->fts_path, O_RDONLY);
-						repo = make_scope(entry->fts_path, fd, st, backup ? string() : original->second);
+						repo = make_scope(entry->fts_path, fd, st, backup || independent ? string() : original->second);
 						if (repo) {
+							policy.observe_scope(repo->path);
 							found(*repo);
 						}
 					}
@@ -922,6 +1067,56 @@ struct Stamp {
 	}
 };
 
+struct SourceCandidate {
+	Integer id;
+	string path, root, repo;
+	Stamp stamp;
+	Integer offset;
+
+	explicit SourceCandidate(const Statement &row) :
+		id(row.number(0)), path(row.bytes(1)), root(row.bytes(2)), repo(row.bytes(3)),
+		stamp(row, 4), offset(row.number(11)) {}
+};
+
+class FirstSourceCache {
+	using Key = std::tuple<Integer, Integer, string, string, string>;
+	using Entries = std::map<Key, std::optional<SourceCandidate>, std::less<>>;
+	// Keep only a small number of rows, including empty lookups. FIFO eviction
+	// bounds memory without retaining source descriptors or qualification results.
+	static constexpr size_t capacity = 64;
+	Entries entries;
+	std::array<Entries::iterator, capacity> order {};
+	size_t next = 0;
+
+public:
+	const std::optional<SourceCandidate> &get(Statement &sources, Integer hash, Integer length,
+		const string &fsid, const string &repo, const string &root, bool &query_started)
+	{
+		query_started = false;
+		const auto found = entries.find(std::tie(hash, length, fsid, repo, root));
+		if (found != entries.end()) {
+			return found->second;
+		}
+		std::optional<SourceCandidate> first;
+		sources.bind(1, hash).bind(2, length).bind(3, fsid).bind(4, repo).bind(5, root);
+		if (sources.next()) {
+			first.emplace(sources);
+			// Preserve the live cursor for fallback on a miss, so a rejected
+			// first row does not require executing this same query a second time.
+			query_started = true;
+		} else {
+			sources.reset();
+		}
+		if (entries.size() == capacity) {
+			entries.erase(order[next]);
+		}
+		const auto inserted = entries.emplace(Key {hash, length, fsid, repo, root}, std::move(first)).first;
+		order[next] = inserted;
+		next = (next + 1) % capacity;
+		return inserted->second;
+	}
+};
+
 bool current(int fd, const Stamp &stamp)
 {
 	struct stat st {};
@@ -929,9 +1124,63 @@ bool current(int fd, const Stamp &stamp)
 		Stamp(st).values == stamp.values;
 }
 
+bool current_managed_scope(const string &root, const string &boundary, const string &state,
+	const ScanPolicy &policy, const Mounts &mounts, bool original_file = false)
+{
+	if (root == boundary || policy.observed_scope(root)) {
+		return true;
+	}
+	if (policy.rejected_scope(root)) {
+		return false;
+	}
+	// Old artifacts such as node_modules may now belong to their installation.
+	// Replay only unvisited deeper roots; normal version roots need no extra IO.
+	std::vector<string> ancestors;
+	for (auto path = original_file ? fs::path(root).parent_path() : fs::path(root);; path = path.parent_path()) {
+		ancestors.push_back(path.string());
+		if (path.string() == boundary) {
+			break;
+		}
+	}
+	std::reverse(ancestors.begin(), ancestors.end());
+	WalkScope scope;
+	for (const auto &path : ancestors) {
+		if (within(path, state) || (path != boundary && mounts.count(path))) {
+			return false;
+		}
+		const Fd dir = open_path(path, O_RDONLY | O_DIRECTORY);
+		struct stat st {};
+		if (!readable_scope_directory(dir, st)) {
+			return false;
+		}
+		const auto previous = scope.repo;
+		select_scope(path, dir, st, policy, scope);
+		if (path != boundary && scope.repo == previous && (!scope.repo || scope.storage)) {
+			const auto original = original_backup(path, state, mounts);
+			if (!original.empty()) {
+				select_scope(path, dir, st, policy, scope, original);
+			}
+		}
+	}
+	const bool valid = original_file ? !scope.repo : scope.repo && scope.repo->path == root;
+	if (!valid) {
+		policy.reject_scope(root);
+	}
+	return valid;
+}
+
 Fd open_indexed(const string &path, const string &root, const string &repo, const Stamp &stamp,
 	const ScanPolicy &policy, const string &state, const Mounts &mounts)
 {
+	if (!within(path, root) || within(path, state) || !policy.allowed_path(path)) {
+		return {};
+	}
+	const auto boundary = policy.scope_boundary(path, mounts);
+	// Partial scans can contain both old and new ownership records. Reject
+	// an old ancestor without letting it source files in the same new scope.
+	if (!boundary.empty() && root.size() < boundary.size()) {
+		return {};
+	}
 	Fd dir = open_path(root, O_RDONLY);
 	struct stat st {};
 	const auto name = std::string_view(root).substr(root.find_last_of('/') + 1);
@@ -947,12 +1196,20 @@ Fd open_indexed(const string &path, const string &root, const string &repo, cons
 		original = qualified_backup_original(parent, parent_path, backup.c_str(), state, mounts) == name;
 	}
 	if (S_ISREG(st.st_mode)) {
-		return path == root && (backup_name(name) || original) && current(dir, stamp) && writable_btrfs(dir)
+		if (original && !backup_name(name) && !policy.file_scope(root) && !boundary.empty() &&
+			!current_managed_scope(root, boundary, state, policy, mounts, true)) {
+			return {};
+		}
+		return path == root && (backup_name(name) || original || policy.file_scope(root)) &&
+			current(dir, stamp) && writable_btrfs(dir)
 			? dir : Fd {};
 	}
 	if (!S_ISDIR(st.st_mode) || !readable_scope_directory(dir, st) || !within(path, root) || path == root ||
 		(!original && !backup_name(name) && !backup_storage_scope(root) && !policy.storage_scope(root) &&
-			!git_repository(dir) && !policy.artifact_scope(root, dir, st))) {
+			policy.managed_scope(root) == ManagedScope::none && !git_repository(dir) && !policy.artifact_scope(root, dir, st))) {
+		return {};
+	}
+	if (!boundary.empty() && !current_managed_scope(root, boundary, state, policy, mounts)) {
 		return {};
 	}
 
@@ -1214,6 +1471,7 @@ public:
 		Statement existing(sql, "SELECT id,root,repo,fsid,device,inode,size,msec,mnsec,csec,cnsec"
 			" FROM files WHERE path=?");
 		Statement touch(sql, "INSERT OR IGNORE INTO scan_seen VALUES (?)");
+		Statement change_owner(sql, "UPDATE files SET root=?,repo=?,pending=1 WHERE id=?");
 		Statement remove(sql, "DELETE FROM files WHERE path=?");
 		Statement add(sql, "INSERT INTO files(path,root,repo,fsid,seen,pending,device,inode,size,msec,mnsec,csec,cnsec)"
 			" VALUES(?,?,?,?,?,1,?,?,?,?,?,?,?)");
@@ -1254,11 +1512,14 @@ public:
 			}
 			const Stamp stamp(st);
 			existing.bind(1, path);
-			const bool unchanged = existing.next() && existing.bytes(1) == repo.path &&
-				existing.bytes(2) == repo.key && existing.bytes(3) == repo.fsid &&
+			const bool indexed = existing.next();
+			const auto previous_id = indexed ? existing.number(0) : 0;
+			const bool same_content = indexed && existing.bytes(3) == repo.fsid &&
 				stamp.values == Stamp(existing, 4).values;
+			const bool unchanged = same_content && existing.bytes(1) == repo.path &&
+				existing.bytes(2) == repo.key;
 			if (unchanged) {
-				touch.bind(1, existing.number(0)).run();
+				touch.bind(1, previous_id).run();
 			}
 			existing.reset();
 			if (unchanged) {
@@ -1267,6 +1528,14 @@ public:
 
 			Fd fd = open_path(path, O_RDONLY);
 			if (!current(fd, stamp)) {
+				return;
+			}
+			if (same_content) {
+				// Scope discovery may change an unchanged file's owner. Its
+				// committed chunk index is still valid, but the new scope must
+				// participate in pending wake-up and candidate selection.
+				change_owner.bind(1, repo.path).bind(2, repo.key).bind(3, previous_id).run();
+				touch.bind(1, previous_id).run();
 				return;
 			}
 			remove.bind(1, path).run();
@@ -1382,6 +1651,10 @@ public:
 		Statement done(sql, "UPDATE files SET pending=0 WHERE id=?");
 		Statement record(sql, "INSERT INTO dedup_totals VALUES (?,?,?,1)"
 			" ON CONFLICT(source,destination) DO UPDATE SET bytes=bytes+excluded.bytes, ranges=ranges+1");
+		// This pass changes only pending flags and statistics. Indexed content,
+		// paths and stamps remain fixed until the next scan, so the raw first row
+		// is reusable; existing descriptor validation and kernel comparison remain unchanged.
+		FirstSourceCache first_sources;
 
 		Integer id = 0;
 		uint64_t bytes = 0, shared = 0;
@@ -1410,17 +1683,37 @@ public:
 					if (offset + length <= completed_until) {
 						continue;
 					}
-					sources.bind(1, chunks.number(2)).bind(2, length).bind(3, fsid).bind(4, repo).bind(5, root);
-					while (!stopping && sources.next()) {
-						if (source_id != sources.number(0)) {
-							source_id = sources.number(0);
-							source = open_indexed(sources.bytes(1), sources.bytes(2),
-								sources.bytes(3), Stamp(sources, 4), policy, state, mounts);
+					const auto hash = chunks.number(2);
+					bool query_started = false;
+					const auto &first = first_sources.get(sources, hash, length, fsid, repo, root, query_started);
+					std::optional<SourceCandidate> fallback;
+					auto next_candidate = [&]() -> const SourceCandidate * {
+						if (!query_started) {
+							sources.bind(1, hash).bind(2, length).bind(3, fsid).bind(4, repo).bind(5, root);
+							query_started = true;
+						}
+						while (sources.next()) {
+							// Resume the original order after the already attempted first
+							// row, including further offsets in that same source file.
+							if (sources.number(0) == first->id && sources.number(11) == first->offset) {
+								continue;
+							}
+							fallback.emplace(sources);
+							return &*fallback;
+						}
+						return nullptr;
+					};
+					for (const auto *candidate = first ? &*first : nullptr; !stopping && candidate;
+						candidate = next_candidate()) {
+						if (source_id != candidate->id) {
+							source_id = candidate->id;
+							source = open_indexed(candidate->path, candidate->root,
+								candidate->repo, candidate->stamp, policy, state, mounts);
 						}
 						if (!source) {
 							continue;
 						}
-						const auto source_offset = sources.number(11);
+						const auto source_offset = candidate->offset;
 						const auto limit = std::min(max_dedup_size, dest_stamp.values[2] - offset);
 						auto requested = length;
 						if (length == static_cast<Integer>(chunk_size) && length < limit) {
@@ -1472,9 +1765,9 @@ public:
 						if (status == 0) {
 							const auto added = newly_shared(before, dest, offset, accepted);
 							if (added && current(dest, dest_stamp)) {
-								record.bind(1, sources.bytes(2)).bind(2, root).bind(3, added).run();
+								record.bind(1, candidate->root).bind(2, root).bind(3, added).run();
 								shared += added;
-								const auto source_path = sources.bytes(1);
+								const auto &source_path = candidate->path;
 								if (!recent_events.empty() && recent_events.back().source == source_path &&
 									recent_events.back().destination == destination_path) {
 									recent_events.back().at = unix_time();
@@ -1621,7 +1914,7 @@ try {
 		std::cout << report.rdbuf();
 		return std::cout ? 0 : 1;
 	}
-	const ScanPolicy policy(priority_roots);
+	const ScanPolicy policy(priority_roots, roots);
 	if (discover) {
 		walk(roots, state, policy, [](const Repository &repo) { std::cout << repo.path << '\n'; },
 			[](const Repository &, const string &, const struct stat &) {});
