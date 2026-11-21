@@ -95,9 +95,11 @@ def publish_release(source, tag, marker, existing_tag, repo):
         print(f"{tag} already published at {url}", file=sys.stderr)
         return
 
+    if source != remote_ref(MAIN):
+        raise ValueError("origin/main moved before the GitHub Release could be created")
     result = subprocess.check_output(
         ("gh", "release", "create", tag, "--repo", repo, "--verify-tag",
-         "--title", f"project-bees {tag}", "--generate-notes"),
+         "--target", source, "--title", f"project-bees {tag}", "--generate-notes"),
         text=True,
     )
     print(result.strip(), file=sys.stderr)

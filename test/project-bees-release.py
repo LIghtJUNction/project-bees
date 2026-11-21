@@ -133,6 +133,19 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual(self.git("--git-dir", self.remote, "tag", "--list"), "v0.1.5\nv1.0.0-rc.1")
         self.assertNotIn("release create", self.calls.read_text())
 
+    def test_rechecks_main_before_creating_a_release_on_retry(self):
+        self.reject_release.touch()
+        self.assert_stopped(self.run_release(tag="v0.1.6"), "Release stopped")
+        self.reject_release.unlink()
+        self.git("checkout", "-b", "new-main")
+        self.git("commit", "--allow-empty", "-m", "Concurrent main update")
+        self.git("checkout", "main")
+        self.move_main.touch()
+        self.assert_stopped(self.run_release(tag="v0.1.6"), "origin/main moved before")
+        self.assertEqual(self.git("--git-dir", self.remote, "rev-parse", "v0.1.6^{}"), self.source)
+        self.assertFalse(self.release.exists())
+        self.assertEqual(self.calls.read_text().count("release create v0.1.6"), 1)
+
     def test_rejects_changed_plan_and_existing_draft(self):
         before = self.refs()
         self.assert_stopped(self.run_release(tag="v0.1.7"), "Planned tag changed")
@@ -157,7 +170,9 @@ class ReleaseTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "v0.1.6")
         self.assertEqual(self.refs(), after_tag)
-        self.assertEqual(self.calls.read_text().count("release create v0.1.6"), 2)
+        calls = self.calls.read_text()
+        self.assertEqual(calls.count("release create v0.1.6"), 2)
+        self.assertEqual(calls.count(f"--verify-tag --target {self.source}"), 2)
 
 
 if __name__ == "__main__":
