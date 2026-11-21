@@ -1,12 +1,21 @@
 # project-bees
 
 `project-bees` is a fork of [Zygo/bees](https://github.com/Zygo/bees) that
-shares identical Btrfs file ranges across local Git repositories, common language
-build and dependency directories, package caches, and user application data.
+shares identical Btrfs file ranges across local Git and README-marked projects,
+language build and dependency directories, package caches, backups, and application data.
 It runs as a regular user and uses the
 upstream CityHash and Btrfs extent-same code. Btrfs
 compares the data in the kernel before sharing storage. Subsequent writes use
 copy-on-write.
+
+## How block sharing works
+
+The index hashes aligned 128 KiB chunks to find candidate matches. It can merge
+consecutive matching chunks into a request of up to 1 MiB. A matching hash is
+only a candidate: the Btrfs deduplication ioctl compares the actual bytes before
+sharing the physical range. Files keep their names and contents, and later
+writes use copy-on-write. The mechanism follows the upstream
+[Btrfs deduplication interface](https://btrfs.readthedocs.io/en/latest/Deduplication.html).
 
 ## Install on Arch Linux
 
@@ -33,16 +42,18 @@ adds a native bar widget and a searchable dashboard for total newly shared
 data, per-repository totals, and repository pairs:
 
 ```sh
-omarchy plugin add https://github.com/LIghtJUNction/omarchy-project-bees --enable
+omarchy plugin add https://github.com/LIghtJUNction/omarchy-project-bees.git --enable
 ```
 
 Click its bar widget or run
 `omarchy-shell shell summon io.github.lightjunction.project-bees` to open it.
 The dashboard also shows whether the latest snapshot reports indexing,
 deduplication, a wait before the next scan, or a stopped daemon. With plugin
-0.1.3, its progress area shows the priority/full pass, current priority directory,
-file and chunk counts, and phase age. Its live log shows the latest actual
-file-to-file sharing records with their newly shared bytes.
+0.1.4, its progress area shows the priority/full pass, current priority directory,
+file and chunk counts, and phase age. The live log immediately shows the current
+activity, retains up to 32 observed progress changes, and combines them with up to
+32 actual file-to-file sharing records. Progress and positive newly shared bytes
+are labeled separately.
 The plugin is independently maintained under the MIT license and pinned in
 this repository at `plugins/project-bees` as a Git submodule. It reads the
 daemon's local statistics snapshot.
@@ -67,11 +78,11 @@ files, and deletions. Use `--interval SECONDS` to change that delay, or repeat
 pass by default. Add `--priority-root DIR` to process a directory inside that
 limit earlier; the option never widens an explicit `--root` limit.
 
-### Scan order and language directories
+### Scan order and recognized scopes
 
-Default system scans process `/var/tmp` and common language caches first, then
-the XDG cache, data, configuration and state directories, followed by a complete
-discovery pass. Each priority directory is scanned and deduplicated before the
+Default system scans process likely duplicate locations before a complete
+discovery pass: `/var/tmp`, common language caches, application and backup
+containers, and the XDG cache, data, configuration and state directories. Each priority directory is scanned and deduplicated before the
 next one. This order is a heuristic based on where repeated builds and installed
 dependencies accumulate; contents still determine whether a match is valid.
 
@@ -82,14 +93,37 @@ dependencies accumulate; contents still determine whether a match is valid.
 | Python | `.venv`, `venv`, `site-packages`, `__pycache__`, `.tox`, `.nox`; pip, uv and Poetry caches |
 | C/C++ / .NET | CMake build trees; manifest-qualified `build`, `bin`, `obj`, `out`, `artifacts`; ccache, sccache and NuGet caches |
 | Other language ecosystems | `.dart_tool`, `Pods`, `.build`, Zig caches/output, `_build`, `.stack-work`, `dist-newstyle`, `_opam`; Composer, Bundler, Go, Pub and other package caches |
+| Application and backup containers | `/opt`, `~/opt`, `~/.local/opt`, `/var/backups`, `~/Backups`, `~/backups`, `~/备份` |
 | User application files | `${XDG_CACHE_HOME:-~/.cache}`, `${XDG_DATA_HOME:-~/.local/share}`, `${XDG_CONFIG_HOME:-~/.config}`, `${XDG_STATE_HOME:-~/.local/state}` |
 
-An arbitrary directory containing `pyvenv.cfg` or `CMakeCache.txt` is also
-recognized. Generic names such as `build`, `dist`, `bin`, `obj`, `vendor` and
+A directory with a regular `README.md` file is recognized even without `.git`;
+the README name is matched without ASCII case sensitivity. Removing `.git`
+while retaining the README preserves the project identity and cached hashes.
+Nested README files keep the existing parent project owner. An arbitrary
+directory containing `pyvenv.cfg` or `CMakeCache.txt` is also recognized. Generic names such as `build`, `dist`, `bin`, `obj`, `vendor` and
 `deps` require a supported project manifest in that directory or its parent.
 This avoids treating every system `bin` or unrelated `build` directory as a
 project output tree. Relevant absolute cache environment variables are honored;
 relative XDG paths fall back to the default user directories.
+
+Backup names are matched without ASCII case sensitivity. File suffixes include
+`.bak`, `.backup`, `.old`, `.orig`, `.save`, and `~`. The tokens `backup`,
+`backups`, `bak`, and `备份` also match standalone names or prefixes/suffixes
+separated by a dot, hyphen, underscore, or space. Common date suffixes are
+accepted, such as `project.BAK-20261121` and `file.bak.2026-11-21_123045`.
+Bare names such as `old`, `copy`, `bakery`, or a date alone do not create scopes.
+
+Backup files and directories have distinct identities, including inside a Git
+or build directory, so a file can share storage with its adjacent backup.
+Outside recognized projects, only an existing original sibling that can be
+inferred from a backup name is included: `foo.txt.bak` can include `foo.txt`,
+and `project.bak` can include `project/`. The precise original name takes
+precedence over stripping a date. A backup does not turn its whole parent
+directory into a scan scope. Backups remain intact; discovery never deletes them.
+
+Only Btrfs files are eligible. Files on tmpfs, including a tmpfs-mounted `/tmp`,
+do not participate. Destination files must be writable by the service's user;
+recognizing a system directory such as `/opt` does not change its permissions.
 
 The directory conventions follow the [XDG specification](https://specifications.freedesktop.org/basedir/latest/),
 [Python virtual-environment documentation](https://docs.python.org/3/library/venv.html),
@@ -129,7 +163,7 @@ directory is `${XDG_STATE_HOME:-$HOME/.local/state}/project-bees`. Use
 The daemon stores cumulative counters in SQLite and atomically replaces the
 JSON snapshot after completed scan and deduplication batches. Readers can
 inspect it while the service is running. The dashboard refreshes on file
-changes and checks again every 30 seconds.
+changes and checks again every 10 seconds.
 
 The counters measure **newly shared logical bytes**. For each successful
 deduplication range, the daemon compares FIEMAP extents before and after the
@@ -144,7 +178,7 @@ repositories; a source subtotal records the other side of the operation.
 | `startedAt`, `updatedAt` | Collection start and snapshot time, as Unix seconds |
 | `totalBytes` | Cumulative newly shared logical bytes |
 | `rangeCount` | Successful ranges with a positive newly shared byte count |
-| `projects[].path` | Repository path |
+| `projects[].path` | Scope path: project, build/cache directory, storage container, or recognized backup-related file |
 | `projects[].bytes` | Bytes credited to this repository as destination |
 | `projects[].sourceBytes` | Bytes credited to other repositories using this source |
 | `pairs[].a`, `pairs[].b` | The two repository paths in byte order |

@@ -98,25 +98,161 @@ bool git_repository(int fd)
 			is_entry(metadata, "commondir", S_IFREG));
 }
 
-bool build_manifest(int dir)
+bool ascii_equal(std::string_view a, std::string_view b)
+{
+	return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+		const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; };
+		return lower(x) == lower(y);
+	});
+}
+
+bool backup_delimiter(char c)
+{
+	return c == '.' || c == '-' || c == '_' || c == ' ';
+}
+
+bool backup_container(std::string_view name)
+{
+	if (!name.empty() && name.front() == '.') {
+		name.remove_prefix(1);
+	}
+	return ascii_equal(name, "backup") || ascii_equal(name, "backups") ||
+		ascii_equal(name, "bak") || name == "备份";
+}
+
+std::string_view without_backup_date(std::string_view name)
+{
+	// Dates qualify a backup marker; an ordinary dated name is not itself a backup.
+	if (name.empty() || name.back() < '0' || name.back() > '9') {
+		return name;
+	}
+	for (size_t start = 1; start < name.size(); ++start) {
+		if (!backup_delimiter(name[start - 1])) {
+			continue;
+		}
+		string digits;
+		for (const char c : name.substr(start)) {
+			if (c >= '0' && c <= '9') {
+				digits += c;
+			} else if (!backup_delimiter(c) && c != ':' && c != 'T' && c != 't') {
+				digits.clear();
+				break;
+			}
+		}
+		if (digits.size() != 8 && digits.size() != 14) {
+			continue;
+		}
+		const auto number = [&](size_t offset, size_t length) {
+			unsigned result = 0;
+			for (const char c : std::string_view(digits).substr(offset, length)) {
+				result = result * 10 + c - '0';
+			}
+			return result;
+		};
+		if (number(0, 4) >= 1900 && number(0, 4) <= 2999 &&
+			number(4, 2) >= 1 && number(4, 2) <= 12 && number(6, 2) >= 1 && number(6, 2) <= 31 &&
+			(digits.size() == 8 || (number(8, 2) < 24 && number(10, 2) < 60 && number(12, 2) < 60))) {
+			return name.substr(0, start - 1);
+		}
+	}
+	return name;
+}
+
+bool backup_name(std::string_view name, string *original = nullptr)
+{
+	name = without_backup_date(name);
+	std::string_view base;
+	bool matched = backup_container(name);
+	if (!matched && name.size() > 1 && name.back() == '~') {
+		base = name.substr(0, name.size() - 1);
+		matched = true;
+	}
+	for (const auto suffix : {".bak", ".backup", ".old", ".orig", ".save"}) {
+		const auto length = std::char_traits<char>::length(suffix);
+		if (!matched && name.size() > length && ascii_equal(name.substr(name.size() - length), suffix)) {
+			base = name.substr(0, name.size() - length);
+			matched = true;
+		}
+	}
+	for (const auto marker : {"backup", "backups", "bak", "备份"}) {
+		const auto length = std::char_traits<char>::length(marker);
+		if (matched || name.size() <= length) {
+			continue;
+		}
+		if (ascii_equal(name.substr(0, length), marker) && backup_delimiter(name[length])) {
+			base = name.substr(length + 1);
+			matched = true;
+		} else if (ascii_equal(name.substr(name.size() - length), marker) &&
+			backup_delimiter(name[name.size() - length - 1])) {
+			base = name.substr(0, name.size() - length - 1);
+			matched = true;
+		}
+	}
+	if (original) {
+		*original = base == "." || base == ".." ? string() : string(base);
+	}
+	return matched;
+}
+
+string backup_original_name(int dir, std::string_view backup, mode_t type)
+{
+	string original;
+	if (!backup_name(backup, &original) || original.empty()) {
+		return {};
+	}
+	// A dated original is still an exact sibling; strip a date only as a fallback.
+	if (is_entry(dir, original.c_str(), type)) {
+		return original;
+	}
+	const string undated(without_backup_date(original));
+	return undated != original && !undated.empty() && undated != "." && undated != ".." &&
+		is_entry(dir, undated.c_str(), type) ? undated : string();
+}
+
+string readme_marker(int dir)
+{
+	for (const auto *name : {"README.md", "readme.md", "Readme.md", "README.MD"}) {
+		if (is_entry(dir, name, S_IFREG)) {
+			return name;
+		}
+	}
+	const int copy = openat(dir, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (copy < 0) {
+		return {};
+	}
+	const auto close_directory = [](DIR *value) { closedir(value); };
+	std::unique_ptr<DIR, decltype(close_directory)> entries(fdopendir(copy), close_directory);
+	if (!entries) {
+		close(copy);
+		return {};
+	}
+	while (const auto *entry = readdir(entries.get())) {
+		if (ascii_equal(entry->d_name, "README.md") && is_entry(dir, entry->d_name, S_IFREG)) {
+			return entry->d_name;
+		}
+	}
+	return {};
+}
+
+string build_manifest(int dir)
 {
 	for (const auto *name : {"Makefile", "package.json", "pom.xml", "build.gradle",
 		"build.gradle.kts", "pubspec.yaml", "CMakeLists.txt", "build.zig", "meson.build",
 		"Cargo.toml", "pyproject.toml", "setup.py", "composer.json", "go.mod", "Gemfile",
 		"Package.swift", "mix.exs", "rebar.config"}) {
 		if (is_entry(dir, name, S_IFREG)) {
-			return true;
+			return name;
 		}
 	}
 	const int copy = fcntl(dir, F_DUPFD_CLOEXEC, 0);
 	if (copy < 0) {
-		return false;
+		return {};
 	}
 	const auto close_directory = [](DIR *value) { closedir(value); };
 	std::unique_ptr<DIR, decltype(close_directory)> entries(fdopendir(copy), close_directory);
 	if (!entries) {
 		close(copy);
-		return false;
+		return {};
 	}
 	while (const auto *entry = readdir(entries.get())) {
 		const std::string_view name(entry->d_name);
@@ -125,14 +261,14 @@ bool build_manifest(int dir)
 			const auto suffix = name.substr(dot);
 			if ((suffix == ".csproj" || suffix == ".fsproj" || suffix == ".vbproj" || suffix == ".vcxproj") &&
 				is_entry(dir, entry->d_name, S_IFREG)) {
-				return true;
+				return string(name);
 			}
 		}
 	}
-	return false;
+	return {};
 }
 
-bool artifact_directory(std::string_view name, int dir)
+bool artifact_name(std::string_view name)
 {
 	for (const auto *candidate : {"target", "node_modules", "bower_components",
 		".venv", "venv", "site-packages", "__pycache__", ".tox", ".nox", ".mypy_cache",
@@ -144,19 +280,34 @@ bool artifact_directory(std::string_view name, int dir)
 			return true;
 		}
 	}
-	if (is_entry(dir, "pyvenv.cfg", S_IFREG) || is_entry(dir, "CMakeCache.txt", S_IFREG)) {
-		return true;
+	return false;
+}
+
+string artifact_marker(std::string_view name, int dir, const string *readme)
+{
+	for (const auto *marker : {"pyvenv.cfg", "CMakeCache.txt"}) {
+		if (is_entry(dir, marker, S_IFREG)) {
+			return marker;
+		}
+	}
+	if (readme && !readme->empty()) {
+		return *readme;
 	}
 	for (const auto *candidate : {"build", "dist", "bin", "obj", "out", "artifacts", "vendor", "deps"}) {
 		if (name == candidate) {
-			if (build_manifest(dir)) {
-				return true;
+			const auto marker = build_manifest(dir);
+			if (!marker.empty()) {
+				return marker;
 			}
 			Fd parent = open_path("..", O_RDONLY | O_DIRECTORY, dir);
-			return static_cast<int>(parent) >= 0 && build_manifest(parent);
+			const auto parent_marker = static_cast<int>(parent) >= 0 ? build_manifest(parent) : string();
+			if (!parent_marker.empty()) {
+				return "../" + parent_marker;
+			}
+			break;
 		}
 	}
-	return false;
+	return readme ? string() : readme_marker(dir);
 }
 
 string identity(const struct stat &st)
@@ -226,14 +377,25 @@ string child_directory(const string &parent, const char *child)
 }
 
 class ScanPolicy {
+	struct Marker {
+		string identity;
+		string name;
+	};
 	std::vector<string> priority;
 	std::set<string, std::less<>> storage;
+	std::set<string, std::less<>> containers;
+	mutable std::map<string, Marker, std::less<>> markers;
 
-	void add(const string &path)
+	void add(const string &path, bool container = true)
 	{
 		auto normalized = absolute_directory(path);
-		if (!normalized.empty() && storage.insert(normalized).second) {
-			priority.push_back(std::move(normalized));
+		if (!normalized.empty()) {
+			if (container) {
+				containers.insert(normalized);
+			}
+			if (storage.insert(normalized).second) {
+				priority.push_back(std::move(normalized));
+			}
 		}
 	}
 
@@ -241,7 +403,7 @@ public:
 	explicit ScanPolicy(const std::vector<string> &extra_priority_roots = {})
 	{
 		for (const auto &path : extra_priority_roots) {
-			add(fs::absolute(path).string());
+			add(fs::absolute(path).string(), false);
 		}
 		const auto home = environment_directory("HOME", {});
 		const auto cache = environment_directory("XDG_CACHE_HOME", child_directory(home, ".cache"));
@@ -253,6 +415,13 @@ public:
 		const auto gradle = environment_directory("GRADLE_USER_HOME", child_directory(home, ".gradle"));
 		const auto bundle = environment_directory("BUNDLE_USER_HOME", child_directory(home, ".bundle"));
 		add("/var/tmp");
+		add("/var/backups");
+		add(child_directory(home, "Backups"));
+		add(child_directory(home, "backups"));
+		add(child_directory(home, "备份"));
+		add("/opt");
+		add(child_directory(home, "opt"));
+		add(child_directory(home, ".local/opt"));
 		for (const auto &path : {
 			child_directory(cargo, "registry"), child_directory(cargo, "git"),
 			child_directory(rustup, "toolchains"),
@@ -312,6 +481,44 @@ public:
 		const auto parent = slash == view.npos ? std::string_view() : view.substr(0, slash ? slash : 1);
 		return storage.count(view) || storage.count(parent);
 	}
+
+	bool storage_container(const string &path) const { return containers.count(path); }
+
+	void begin_scan() const { markers.clear(); }
+
+	bool artifact_scope(const string &path, int dir, const struct stat &st, const string *readme = nullptr) const
+	{
+		const auto name = std::string_view(path).substr(path.find_last_of('/') + 1);
+		if (artifact_name(name)) {
+			return true;
+		}
+		const auto key = identity(st);
+		const string no_readme;
+		const auto supplied = storage_container(path) ? &no_readme : readme;
+		if (readme) {
+			// The walk already has the exact README name, including unusual casing.
+			// Only selected roots need evidence retained; ordinary directories do not.
+			const auto marker = artifact_marker(name, dir, supplied);
+			if (marker.empty()) {
+				markers.erase(path);
+			} else {
+				markers[path] = {key, marker};
+			}
+			return !marker.empty();
+		}
+		auto [cached, inserted] = markers.try_emplace(path, Marker {key, {}});
+		if (inserted || cached->second.identity != key) {
+			cached->second = {key, artifact_marker(name, dir, supplied)};
+		} else if (!cached->second.name.empty()) {
+			if (is_entry(dir, cached->second.name.c_str(), S_IFREG)) {
+				return true;
+			}
+			cached->second.name = artifact_marker(name, dir, supplied);
+		}
+		// Revalidate the precise marker on every open. A failed lookup remains
+		// negative for this pass, avoiding a full directory search for every file.
+		return !cached->second.name.empty() && is_entry(dir, cached->second.name.c_str(), S_IFREG);
+	}
 };
 
 std::vector<string> traversal_roots(const std::vector<string> &requested, const Mounts &mounts)
@@ -347,26 +554,148 @@ bool readable_scope_directory(int fd, struct stat &st)
 	return true;
 }
 
-void select_scope(const string &path, int dir, const struct stat &st, const ScanPolicy &policy, WalkScope &scope)
+struct DirectoryNames {
+	std::map<string, string, std::less<>> originals;
+	string readme;
+};
+
+string qualified_backup_original(int dir, const string &path, const char *name,
+	const string &state, const Mounts &mounts)
+{
+	string original;
+	if (!backup_name(name, &original) || original.empty()) {
+		return {};
+	}
+	const auto backup_path = (fs::path(path) / name).string();
+	if (within(backup_path, state) || mounts.count(backup_path)) {
+		return {};
+	}
+	struct stat backup {}, source {};
+	if (fstatat(dir, name, &backup, AT_SYMLINK_NOFOLLOW) < 0 ||
+		(!S_ISREG(backup.st_mode) && !S_ISDIR(backup.st_mode))) {
+		return {};
+	}
+	original = backup_original_name(dir, name, backup.st_mode & S_IFMT);
+	if (original.empty()) {
+		return {};
+	}
+	const auto original_path = (fs::path(path) / original).string();
+	if (within(original_path, state) || mounts.count(original_path) ||
+		fstatat(dir, original.c_str(), &source, AT_SYMLINK_NOFOLLOW) < 0 ||
+		(backup.st_mode & S_IFMT) != (source.st_mode & S_IFMT)) {
+		return {};
+	}
+	if (S_ISREG(backup.st_mode)) {
+		if (backup.st_nlink != 1 || source.st_nlink != 1) {
+			return {};
+		}
+	} else if (S_ISDIR(backup.st_mode)) {
+		for (const auto &candidate : {string(name), original}) {
+			const Fd fd = open_path(candidate, O_RDONLY | O_DIRECTORY, dir);
+			struct stat st {};
+			if (!readable_scope_directory(fd, st)) {
+				return {};
+			}
+		}
+	} else {
+		return {};
+	}
+	return original;
+}
+
+void directory_name(DirectoryNames &names, int dir, const string &path, const char *name,
+	const string &state, const Mounts &mounts)
+{
+	if (ascii_equal(name, "README.md") && is_entry(dir, name, S_IFREG)) {
+		names.readme = name;
+	}
+	const auto original = qualified_backup_original(dir, path, name, state, mounts);
+	if (original.empty()) {
+		return;
+	}
+	auto [position, inserted] = names.originals.emplace(original, name);
+	if (!inserted && position->second > name) {
+		position->second = name;
+	}
+}
+
+string original_backup(const string &path, const string &state, const Mounts &mounts)
+{
+	const auto parent = fs::path(path).parent_path().string();
+	const Fd dir = open_path(parent, O_RDONLY | O_DIRECTORY);
+	const int copy = fcntl(dir, F_DUPFD_CLOEXEC, 0);
+	if (copy < 0) {
+		return {};
+	}
+	const auto close_directory = [](DIR *value) { closedir(value); };
+	std::unique_ptr<DIR, decltype(close_directory)> entries(fdopendir(copy), close_directory);
+	if (!entries) {
+		close(copy);
+		return {};
+	}
+	DirectoryNames names;
+	while (!stopping) {
+		errno = 0;
+		const auto *entry = readdir(entries.get());
+		if (!entry) {
+			if (errno) {
+				throw std::system_error(errno, std::generic_category(), "backup siblings " + parent);
+			}
+			break;
+		}
+		directory_name(names, dir, parent, entry->d_name, state, mounts);
+	}
+	const auto found = names.originals.find(fs::path(path).filename().string());
+	return found == names.originals.end() ? string() : found->second;
+}
+
+bool backup_storage_scope(const string &path)
+{
+	return backup_container(fs::path(path).parent_path().filename().string());
+}
+
+std::shared_ptr<Repository> make_scope(const string &path, int fd, const struct stat &st,
+	const string &backup = {})
+{
+	crucible::BtrfsIoctlFsInfoArgs info;
+	if (!info.do_ioctl_nothrow(fd) || !info.sectorsize || info.sectorsize > chunk_size) {
+		return {};
+	}
+	const auto uuid = info.fsid();
+	// An exact sibling witness makes an otherwise ordinary original independently
+	// eligible without admitting its parent, and can be rechecked without a search.
+	const auto key = identity(st) + (backup.empty() ? string() : ":" + backup);
+	return std::make_shared<Repository>(Repository {
+		path, key, string(uuid.begin(), uuid.end()), info.sectorsize,
+	});
+}
+
+void select_scope(const string &path, int dir, const struct stat &st, const ScanPolicy &policy, WalkScope &scope,
+	const string &original = {}, const string *readme = nullptr)
 {
 	const auto name = std::string_view(path).substr(path.find_last_of('/') + 1);
+	const bool backup = backup_name(name);
 	if (scope.repo && name == ".git") {
 		scope.metadata = true;
 	}
-	if (scope.metadata) {
+	if (scope.metadata && !backup) {
 		return;
 	}
-	const bool git = git_repository(dir);
-	const bool artifact = !git && (!scope.repo || scope.storage) && artifact_directory(name, dir);
-	const bool storage = !git && !artifact && (!scope.repo || scope.storage) && policy.storage_scope(path);
-	if (git || artifact || storage) {
-		crucible::BtrfsIoctlFsInfoArgs info;
-		if (info.do_ioctl_nothrow(dir) && info.sectorsize && info.sectorsize <= chunk_size) {
-			const auto uuid = info.fsid();
-			scope.repo = std::make_shared<Repository>(Repository {
-				path, identity(st), string(uuid.begin(), uuid.end()), info.sectorsize,
-			});
-			scope.storage = storage;
+	const bool git = !scope.metadata && git_repository(dir);
+	// A README describing a known cache/application container must not collapse
+	// its application scopes. Explicit project priorities retain normal markers.
+	const bool artifact = !git && !backup && (!scope.repo || scope.storage) &&
+		policy.artifact_scope(path, dir, st, readme);
+	const bool storage = !git && !backup && !artifact && (!scope.repo || scope.storage) &&
+		(policy.storage_scope(path) || backup_storage_scope(path));
+	const bool paired = !git && !backup && !artifact && !storage && (!scope.repo || scope.storage) && !original.empty();
+	if (git || backup || artifact || storage || paired) {
+		if (auto selected = make_scope(path, dir, st, paired ? original : string())) {
+			scope.repo = std::move(selected);
+			scope.storage = storage || (!git && backup_container(name));
+			if (backup) {
+				scope.metadata = false;
+			}
 		}
 	}
 }
@@ -399,7 +728,8 @@ bool inherit_scope(const string &root, const string &state, const ScanPolicy &po
 		if (!readable_scope_directory(dir, st) || (path == boundary && !writable_btrfs(dir))) {
 			return false;
 		}
-		select_scope(path, dir, st, policy, scope);
+		select_scope(path, dir, st, policy, scope,
+			path == boundary ? string() : original_backup(path, state, mounts));
 	}
 	return true;
 }
@@ -428,6 +758,7 @@ void walk(const std::vector<string> &requested, const string &state, const ScanP
 			throw std::runtime_error("cannot open directory walk for " + root);
 		}
 		std::vector<WalkScope> scopes;
+		std::vector<DirectoryNames> names;
 		while (!stopping) {
 			errno = 0;
 			auto *entry = fts_read(tree.get());
@@ -440,6 +771,7 @@ void walk(const std::vector<string> &requested, const string &state, const ScanP
 			const size_t level = entry->fts_level;
 			if (entry->fts_info == FTS_D) {
 				scopes.resize(level);
+				names.resize(level);
 				const string path = entry->fts_path;
 				auto scope = level ? scopes.back() : initial;
 				const bool boundary = level && mounts.count(path);
@@ -455,16 +787,51 @@ void walk(const std::vector<string> &requested, const string &state, const ScanP
 					continue;
 				}
 				const auto previous = scope.repo;
-				select_scope(path, dir, st, policy, scope);
+				string original;
+				if (level) {
+					const auto candidate = names.back().originals.find(entry->fts_name);
+					if (candidate != names.back().originals.end()) {
+						original = candidate->second;
+					}
+				} else if (complete_roots && std::any_of(boundaries.begin(), boundaries.end(),
+					[&](const auto &boundary) { return path != boundary && within(path, boundary); })) {
+					original = original_backup(path, state, mounts);
+				}
+				DirectoryNames children;
+				errno = 0;
+				auto *child = fts_children(tree.get(), 0);
+				if (!child && errno) {
+					throw std::system_error(errno, std::generic_category(), "directory children " + path);
+				}
+				for (; child && !stopping; child = child->fts_link) {
+					directory_name(children, dir, path, child->fts_name, state, mounts);
+				}
+				select_scope(path, dir, st, policy, scope, original, &children.readme);
 				if (scope.repo && (scope.repo != previous || !level)) {
 					found(*scope.repo);
 				}
 				scopes.push_back(std::move(scope));
+				names.push_back(std::move(children));
 			} else if ((entry->fts_info == FTS_F || entry->fts_info == FTS_NSOK) &&
-				level && scopes.size() >= level && scopes[level - 1].repo) {
+				level && scopes.size() >= level) {
+				auto repo = scopes[level - 1].repo;
+				const auto original = names[level - 1].originals.find(entry->fts_name);
+				const bool backup = backup_name(entry->fts_name);
+				if (!repo && !backup && original == names[level - 1].originals.end()) {
+					continue;
+				}
 				struct stat st {};
 				if (!mounts.count(entry->fts_path) && lstat(entry->fts_path, &st) == 0 && S_ISREG(st.st_mode)) {
-					file(*scopes[level - 1].repo, entry->fts_path, st);
+					if (st.st_nlink == 1 && (backup || (!repo && original != names[level - 1].originals.end()))) {
+						const Fd fd = open_path(entry->fts_path, O_RDONLY);
+						repo = make_scope(entry->fts_path, fd, st, backup ? string() : original->second);
+						if (repo) {
+							found(*repo);
+						}
+					}
+					if (repo) {
+						file(*repo, entry->fts_path, st);
+					}
 				}
 			}
 		}
@@ -563,13 +930,29 @@ bool current(int fd, const Stamp &stamp)
 }
 
 Fd open_indexed(const string &path, const string &root, const string &repo, const Stamp &stamp,
-	const ScanPolicy &policy)
+	const ScanPolicy &policy, const string &state, const Mounts &mounts)
 {
-	Fd dir = open_path(root, O_RDONLY | O_DIRECTORY);
+	Fd dir = open_path(root, O_RDONLY);
 	struct stat st {};
 	const auto name = std::string_view(root).substr(root.find_last_of('/') + 1);
-	if (fstat(dir, &st) < 0 || identity(st) != repo ||
-		(!policy.storage_scope(root) && !git_repository(dir) && !artifact_directory(name, dir))) {
+	const auto separator = repo.find(':');
+	if (fstat(dir, &st) < 0 || identity(st) != repo.substr(0, separator)) {
+		return {};
+	}
+	bool original = false;
+	if (separator != string::npos) {
+		const auto backup = repo.substr(separator + 1);
+		const auto parent_path = fs::path(root).parent_path().string();
+		const Fd parent = open_path(parent_path, O_RDONLY | O_DIRECTORY);
+		original = qualified_backup_original(parent, parent_path, backup.c_str(), state, mounts) == name;
+	}
+	if (S_ISREG(st.st_mode)) {
+		return path == root && (backup_name(name) || original) && current(dir, stamp) && writable_btrfs(dir)
+			? dir : Fd {};
+	}
+	if (!S_ISDIR(st.st_mode) || !readable_scope_directory(dir, st) || !within(path, root) || path == root ||
+		(!original && !backup_name(name) && !backup_storage_scope(root) && !policy.storage_scope(root) &&
+			!git_repository(dir) && !policy.artifact_scope(root, dir, st))) {
 		return {};
 	}
 
@@ -814,6 +1197,7 @@ public:
 	void scan(const std::vector<string> &roots, bool complete = true,
 		const std::vector<string> *complete_roots = nullptr)
 	{
+		policy.begin_scan();
 		activity = Activity {};
 		activity.scan_kind = complete ? "full" : "priority";
 		activity.scan_root = !complete && roots.size() == 1 ? roots.front() : "";
@@ -942,6 +1326,7 @@ public:
 	void dedup(bool partial = false)
 	{
 		phase("deduplicating");
+		const auto mounts = read_mounts();
 		auto *sql = db.get();
 		Statement has_existing(sql, "SELECT 1 FROM files WHERE pending=0 LIMIT 1");
 		const bool have_existing = has_existing.next();
@@ -957,7 +1342,8 @@ public:
 			const string wake = R"SQL(
 				WITH fresh AS MATERIALIZED (
 					SELECT added.hash, added.length, f.fsid,
-						min(f.repo) AS first_repo, max(f.repo) AS last_repo
+						min(f.repo) AS first_repo, max(f.repo) AS last_repo,
+						min(f.root) AS first_root, max(f.root) AS last_root
 					FROM )SQL" + fresh_input + R"SQL(
 					WHERE f.pending=1 GROUP BY added.hash, added.length, f.fsid
 				)
@@ -967,6 +1353,7 @@ public:
 					CROSS JOIN files old ON old.id=match.file
 					WHERE old.pending=0 AND old.fsid=fresh.fsid
 						AND (old.repo<>fresh.first_repo OR old.repo<>fresh.last_repo)
+						AND (old.root<>fresh.first_root OR old.root<>fresh.last_root)
 				)
 			)SQL";
 			exec(wake.c_str());
@@ -978,14 +1365,16 @@ public:
 			"SELECT id,path,root,repo,fsid,device,inode,size,msec,mnsec,csec,cnsec"
 			" FROM files WHERE pending=1 AND id>? ORDER BY id LIMIT 1");
 		Statement chunks(sql, "SELECT start,length,hash FROM chunks WHERE file=?");
+		// A paired root can retain different witness keys during a partial scan;
+		// its files still belong to one scope and must never source each other.
 		Statement sources(sql, "SELECT f.id,f.path,f.root,f.repo,f.device,f.inode,f.size,"
 			" f.msec,f.mnsec,f.csec,f.cnsec,c.start FROM chunks c JOIN files f ON f.id=c.file"
-			" WHERE c.hash=? AND c.length=? AND f.fsid=? AND f.repo<>? ORDER BY c.file,c.start");
+			" WHERE c.hash=? AND c.length=? AND f.fsid=? AND f.repo<>? AND f.root<>? ORDER BY c.file,c.start");
 		Statement consecutive(sql, R"SQL(
 			SELECT d.start, d.length, s.hash=d.hash AND s.length=d.length AND NOT EXISTS (
 				SELECT 1 FROM chunks earlier JOIN files f ON f.id=earlier.file
 				WHERE earlier.hash=d.hash AND earlier.length=d.length AND earlier.file<=s.file
-					AND (earlier.file<s.file OR earlier.start<s.start) AND f.fsid=?7 AND f.repo<>?8
+					AND (earlier.file<s.file OR earlier.start<s.start) AND f.fsid=?7 AND f.repo<>?8 AND f.root<>?9
 			)
 			FROM chunks d LEFT JOIN chunks s ON s.file=?1 AND s.start=?2+(d.start-?3)
 			WHERE d.file=?4 AND d.start>=?5 AND d.start<?6 ORDER BY d.start
@@ -1007,7 +1396,7 @@ public:
 			const auto fsid = pending.bytes(4);
 			const Stamp dest_stamp(pending, 5);
 			const auto destination_path = pending.bytes(1);
-			const Fd dest = open_indexed(destination_path, root, repo, dest_stamp, policy);
+			const Fd dest = open_indexed(destination_path, root, repo, dest_stamp, policy, state, mounts);
 			pending.reset();
 			bool retry = false;
 			if (static_cast<int>(dest) >= 0) {
@@ -1021,12 +1410,12 @@ public:
 					if (offset + length <= completed_until) {
 						continue;
 					}
-					sources.bind(1, chunks.number(2)).bind(2, length).bind(3, fsid).bind(4, repo);
+					sources.bind(1, chunks.number(2)).bind(2, length).bind(3, fsid).bind(4, repo).bind(5, root);
 					while (!stopping && sources.next()) {
 						if (source_id != sources.number(0)) {
 							source_id = sources.number(0);
 							source = open_indexed(sources.bytes(1), sources.bytes(2),
-								sources.bytes(3), Stamp(sources, 4), policy);
+								sources.bytes(3), Stamp(sources, 4), policy, state, mounts);
 						}
 						if (!source) {
 							continue;
@@ -1039,7 +1428,7 @@ public:
 							// content within a file, so batching preserves space savings.
 							consecutive.bind(1, source_id).bind(2, source_offset).bind(3, offset)
 								.bind(4, id).bind(5, offset + length).bind(6, offset + limit)
-								.bind(7, fsid).bind(8, repo);
+								.bind(7, fsid).bind(8, repo).bind(9, root);
 							while (consecutive.next()) {
 								if (!consecutive.number(2) || consecutive.number(0) != offset + requested ||
 									consecutive.number(1) > limit - requested) {
@@ -1207,9 +1596,9 @@ try {
 			std::cout << "Usage: project-bees [--root DIR]... [--state-dir DIR]\n"
 				"                    [--priority-root DIR]...\n"
 				"                    [--interval SECONDS] [--once | --discover | --stats]\n"
-				"Discover Git repositories and standalone build/dependency directories on mounted\n"
+				"Discover Git/README projects, build/dependency directories, and named backups on mounted\n"
 				"writable Btrfs filesystems and deduplicate ranges across scopes.\n"
-				"Default system scans process build caches and user data directories first.\n"
+				"Default system scans prioritize build caches, backups, opt applications, and user data.\n"
 				"--priority-root adds an early directory pass within any --root limit.\n"
 				"The default interval is 300 seconds after each pass.\n"
 				"--stats prints the daemon's cumulative statistics as JSON.\n";
