@@ -9,6 +9,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <dirent.h>
 #include <filesystem>
 #include <fstream>
 #include <fts.h>
@@ -19,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <mntent.h>
+#include <set>
 #include <sqlite3.h>
 #include <stdexcept>
 #include <string_view>
@@ -96,9 +98,65 @@ bool git_repository(int fd)
 			is_entry(metadata, "commondir", S_IFREG));
 }
 
-bool artifact_directory(std::string_view name)
+bool build_manifest(int dir)
 {
-	return name == "target" || name == "node_modules";
+	for (const auto *name : {"Makefile", "package.json", "pom.xml", "build.gradle",
+		"build.gradle.kts", "pubspec.yaml", "CMakeLists.txt", "build.zig", "meson.build",
+		"Cargo.toml", "pyproject.toml", "setup.py", "composer.json", "go.mod", "Gemfile",
+		"Package.swift", "mix.exs", "rebar.config"}) {
+		if (is_entry(dir, name, S_IFREG)) {
+			return true;
+		}
+	}
+	const int copy = fcntl(dir, F_DUPFD_CLOEXEC, 0);
+	if (copy < 0) {
+		return false;
+	}
+	const auto close_directory = [](DIR *value) { closedir(value); };
+	std::unique_ptr<DIR, decltype(close_directory)> entries(fdopendir(copy), close_directory);
+	if (!entries) {
+		close(copy);
+		return false;
+	}
+	while (const auto *entry = readdir(entries.get())) {
+		const std::string_view name(entry->d_name);
+		const auto dot = name.find_last_of('.');
+		if (dot != name.npos) {
+			const auto suffix = name.substr(dot);
+			if ((suffix == ".csproj" || suffix == ".fsproj" || suffix == ".vbproj" || suffix == ".vcxproj") &&
+				is_entry(dir, entry->d_name, S_IFREG)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool artifact_directory(std::string_view name, int dir)
+{
+	for (const auto *candidate : {"target", "node_modules", "bower_components",
+		".venv", "venv", "site-packages", "__pycache__", ".tox", ".nox", ".mypy_cache",
+		".pytest_cache", ".ruff_cache", ".next", ".nuxt", ".svelte-kit", ".angular",
+		".parcel-cache", ".turbo", ".yarn", ".gradle", ".dart_tool", "Pods", ".build", "_build",
+		".zig-cache", "zig-cache", "zig-out", "zig-pkg",
+		".stack-work", "dist-newstyle", "_opam"}) {
+		if (name == candidate) {
+			return true;
+		}
+	}
+	if (is_entry(dir, "pyvenv.cfg", S_IFREG) || is_entry(dir, "CMakeCache.txt", S_IFREG)) {
+		return true;
+	}
+	for (const auto *candidate : {"build", "dist", "bin", "obj", "out", "artifacts", "vendor", "deps"}) {
+		if (name == candidate) {
+			if (build_manifest(dir)) {
+				return true;
+			}
+			Fd parent = open_path("..", O_RDONLY | O_DIRECTORY, dir);
+			return static_cast<int>(parent) >= 0 && build_manifest(parent);
+		}
+	}
+	return false;
 }
 
 string identity(const struct stat &st)
@@ -143,10 +201,121 @@ bool within(const string &path, const string &root)
 		(path.compare(0, root.size(), root) == 0 && path[root.size()] == '/');
 }
 
-template <class VisitRepository, class VisitFile>
-void walk(const std::vector<string> &requested, const string &state, VisitRepository found, VisitFile file)
+string absolute_directory(const string &path)
 {
-	const auto mounts = read_mounts();
+	if (path.empty() || !fs::path(path).is_absolute()) {
+		return {};
+	}
+	auto result = fs::path(path).lexically_normal().string();
+	while (result.size() > 1 && result.back() == '/') {
+		result.pop_back();
+	}
+	return result;
+}
+
+string environment_directory(const char *name, const string &fallback)
+{
+	const auto *value = std::getenv(name);
+	const auto configured = value ? absolute_directory(value) : string();
+	return configured.empty() ? fallback : configured;
+}
+
+string child_directory(const string &parent, const char *child)
+{
+	return parent.empty() ? string() : (fs::path(parent) / child).string();
+}
+
+class ScanPolicy {
+	std::vector<string> priority;
+	std::set<string, std::less<>> storage;
+
+	void add(const string &path)
+	{
+		auto normalized = absolute_directory(path);
+		if (!normalized.empty() && storage.insert(normalized).second) {
+			priority.push_back(std::move(normalized));
+		}
+	}
+
+public:
+	explicit ScanPolicy(const std::vector<string> &extra_priority_roots = {})
+	{
+		for (const auto &path : extra_priority_roots) {
+			add(fs::absolute(path).string());
+		}
+		const auto home = environment_directory("HOME", {});
+		const auto cache = environment_directory("XDG_CACHE_HOME", child_directory(home, ".cache"));
+		const auto data = environment_directory("XDG_DATA_HOME", child_directory(home, ".local/share"));
+		const auto config = environment_directory("XDG_CONFIG_HOME", child_directory(home, ".config"));
+		const auto state = environment_directory("XDG_STATE_HOME", child_directory(home, ".local/state"));
+		const auto cargo = environment_directory("CARGO_HOME", child_directory(home, ".cargo"));
+		const auto rustup = environment_directory("RUSTUP_HOME", child_directory(home, ".rustup"));
+		const auto gradle = environment_directory("GRADLE_USER_HOME", child_directory(home, ".gradle"));
+		const auto bundle = environment_directory("BUNDLE_USER_HOME", child_directory(home, ".bundle"));
+		add("/var/tmp");
+		for (const auto &path : {
+			child_directory(cargo, "registry"), child_directory(cargo, "git"),
+			child_directory(rustup, "toolchains"),
+			environment_directory("GOMODCACHE", child_directory(home, "go/pkg/mod")),
+			environment_directory("GOCACHE", child_directory(cache, "go-build")),
+			child_directory(home, ".m2/repository"), child_directory(gradle, "caches"),
+			child_directory(home, ".ivy2/cache"), child_directory(cache, "coursier"),
+			environment_directory("NUGET_PACKAGES", child_directory(home, ".nuget/packages")),
+			environment_directory("NUGET_HTTP_CACHE_PATH", child_directory(data, "NuGet/v3-cache")),
+			environment_directory("UV_CACHE_DIR", child_directory(cache, "uv")),
+			environment_directory("PIP_CACHE_DIR", child_directory(cache, "pip")),
+			child_directory(cache, "pypoetry"),
+			environment_directory("npm_config_cache", child_directory(home, ".npm")),
+			environment_directory("YARN_CACHE_FOLDER", child_directory(cache, "yarn")),
+			child_directory(home, ".yarn/berry"),
+			child_directory(environment_directory("PNPM_HOME", child_directory(data, "pnpm")), "store"),
+			child_directory(home, ".bun/install/cache"),
+			environment_directory("PUB_CACHE", child_directory(home, ".pub-cache")),
+			environment_directory("COMPOSER_CACHE_DIR", child_directory(cache, "composer")),
+			environment_directory("BUNDLE_USER_CACHE", child_directory(bundle, "cache")),
+			child_directory(home, ".gem"), child_directory(home, ".cabal/store"),
+			child_directory(home, ".stack"), child_directory(home, ".julia"),
+			environment_directory("OPAMROOT", child_directory(home, ".opam")),
+			child_directory(home, ".hex"), child_directory(home, ".mix"),
+			environment_directory("CCACHE_DIR", child_directory(cache, "ccache")),
+			environment_directory("SCCACHE_DIR", child_directory(cache, "sccache")),
+			child_directory(home, ".conan2/p"), child_directory(cache, "vcpkg"),
+			child_directory(cache, "org.swift.swiftpm")}) {
+			add(path);
+		}
+		add(cache);
+		add(data);
+		add(config);
+		add(state);
+	}
+
+	std::vector<string> priority_roots(const std::vector<string> &requested) const
+	{
+		std::vector<string> result;
+		for (const auto &path : priority) {
+			if (!requested.empty() && std::none_of(requested.begin(), requested.end(),
+				[&](const auto &root) { return within(path, root); })) {
+				continue;
+			}
+			const Fd dir = open_path(path, O_RDONLY | O_DIRECTORY);
+			if (writable_btrfs(dir)) {
+				result.push_back(path);
+			}
+		}
+		return result;
+	}
+
+	bool storage_scope(const string &path) const
+	{
+		const std::string_view view(path);
+		const auto slash = view.find_last_of('/');
+		const auto parent = slash == view.npos ? std::string_view() : view.substr(0, slash ? slash : 1);
+		return storage.count(view) || storage.count(parent);
+	}
+};
+
+std::vector<string> traversal_roots(const std::vector<string> &requested, const Mounts &mounts)
+{
 	std::vector<string> roots = requested;
 	for (const auto &[path, eligible] : mounts) {
 		if (eligible && (requested.empty() ||
@@ -156,10 +325,100 @@ void walk(const std::vector<string> &requested, const string &state, VisitReposi
 	}
 	std::sort(roots.begin(), roots.end());
 	roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+	return roots;
+}
+
+struct WalkScope {
+	std::shared_ptr<Repository> repo;
+	bool metadata = false;
+	bool storage = false;
+};
+
+bool readable_scope_directory(int fd, struct stat &st)
+{
+	if (fstat(fd, &st) < 0) {
+		return false;
+	}
+	if (st.st_ino == BTRFS_FIRST_FREE_OBJECTID) {
+		uint64_t flags = 0;
+		return writable_btrfs(fd) && ioctl(fd, BTRFS_IOC_SUBVOL_GETFLAGS, &flags) == 0 &&
+			!(flags & BTRFS_SUBVOL_RDONLY);
+	}
+	return true;
+}
+
+void select_scope(const string &path, int dir, const struct stat &st, const ScanPolicy &policy, WalkScope &scope)
+{
+	const auto name = std::string_view(path).substr(path.find_last_of('/') + 1);
+	if (scope.repo && name == ".git") {
+		scope.metadata = true;
+	}
+	if (scope.metadata) {
+		return;
+	}
+	const bool git = git_repository(dir);
+	const bool artifact = !git && (!scope.repo || scope.storage) && artifact_directory(name, dir);
+	const bool storage = !git && !artifact && (!scope.repo || scope.storage) && policy.storage_scope(path);
+	if (git || artifact || storage) {
+		crucible::BtrfsIoctlFsInfoArgs info;
+		if (info.do_ioctl_nothrow(dir) && info.sectorsize && info.sectorsize <= chunk_size) {
+			const auto uuid = info.fsid();
+			scope.repo = std::make_shared<Repository>(Repository {
+				path, identity(st), string(uuid.begin(), uuid.end()), info.sectorsize,
+			});
+			scope.storage = storage;
+		}
+	}
+}
+
+bool inherit_scope(const string &root, const string &state, const ScanPolicy &policy,
+	const Mounts &mounts, const std::vector<string> &boundaries, WalkScope &scope)
+{
+	// Enter a priority subtree with the same owner as the complete traversal.
+	string boundary;
+	for (const auto &path : boundaries) {
+		if (within(root, path) && path.size() > boundary.size()) {
+			boundary = path;
+		}
+	}
+	if (boundary.empty()) {
+		return false;
+	}
+	std::vector<string> ancestors;
+	for (auto path = fs::path(root); path.string() != boundary;) {
+		path = path.parent_path();
+		ancestors.push_back(path.string());
+	}
+	std::reverse(ancestors.begin(), ancestors.end());
+	for (const auto &path : ancestors) {
+		if (within(path, state) || (path != boundary && mounts.count(path))) {
+			return false;
+		}
+		const Fd dir = open_path(path, O_RDONLY | O_DIRECTORY);
+		struct stat st {};
+		if (!readable_scope_directory(dir, st) || (path == boundary && !writable_btrfs(dir))) {
+			return false;
+		}
+		select_scope(path, dir, st, policy, scope);
+	}
+	return true;
+}
+
+template <class VisitRepository, class VisitFile>
+void walk(const std::vector<string> &requested, const string &state, const ScanPolicy &policy,
+	VisitRepository found, VisitFile file, const std::vector<string> *complete_roots = nullptr)
+{
+	const auto mounts = read_mounts();
+	auto roots = traversal_roots(requested, mounts);
+	const auto boundaries = complete_roots ? traversal_roots(*complete_roots, mounts) : std::vector<string>();
 
 	for (auto &root : roots) {
 		Fd root_fd = open_path(root, O_RDONLY | O_DIRECTORY);
 		if (!writable_btrfs(root_fd) || stopping) {
+			continue;
+		}
+		WalkScope initial;
+		if (complete_roots && !inherit_scope(root, state, policy, mounts, boundaries, initial)) {
 			continue;
 		}
 		char *paths[] = {root.data(), nullptr};
@@ -168,11 +427,7 @@ void walk(const std::vector<string> &requested, const string &state, VisitReposi
 		if (!tree) {
 			throw std::runtime_error("cannot open directory walk for " + root);
 		}
-		struct Scope {
-			std::shared_ptr<Repository> repo;
-			bool metadata = false;
-		};
-		std::vector<Scope> scopes;
+		std::vector<WalkScope> scopes;
 		while (!stopping) {
 			errno = 0;
 			auto *entry = fts_read(tree.get());
@@ -186,7 +441,7 @@ void walk(const std::vector<string> &requested, const string &state, VisitReposi
 			if (entry->fts_info == FTS_D) {
 				scopes.resize(level);
 				const string path = entry->fts_path;
-				auto scope = level ? scopes.back() : Scope {};
+				auto scope = level ? scopes.back() : initial;
 				const bool boundary = level && mounts.count(path);
 				if (boundary || within(path, state)) {
 					fts_set(tree.get(), entry, FTS_SKIP);
@@ -195,32 +450,14 @@ void walk(const std::vector<string> &requested, const string &state, VisitReposi
 
 				const Fd dir = open_path(path, O_RDONLY | O_DIRECTORY);
 				struct stat st {};
-				if (fstat(dir, &st) < 0) {
+				if (!readable_scope_directory(dir, st)) {
 					fts_set(tree.get(), entry, FTS_SKIP);
 					continue;
 				}
-				if (st.st_ino == BTRFS_FIRST_FREE_OBJECTID) {
-					uint64_t flags = 0;
-					if (!writable_btrfs(dir) ||
-						ioctl(dir, BTRFS_IOC_SUBVOL_GETFLAGS, &flags) < 0 || (flags & BTRFS_SUBVOL_RDONLY)) {
-						fts_set(tree.get(), entry, FTS_SKIP);
-						continue;
-					}
-				}
-
-				if (scope.repo && string(entry->fts_name) == ".git") {
-					scope.metadata = true;
-				}
-				if (!scope.metadata && (git_repository(dir) ||
-					(!scope.repo && artifact_directory(entry->fts_name)))) {
-					crucible::BtrfsIoctlFsInfoArgs info;
-					if (info.do_ioctl_nothrow(dir) && info.sectorsize && info.sectorsize <= chunk_size) {
-						const auto uuid = info.fsid();
-						scope.repo = std::make_shared<Repository>(Repository {
-							path, identity(st), string(uuid.begin(), uuid.end()), info.sectorsize,
-						});
-						found(*scope.repo);
-					}
+				const auto previous = scope.repo;
+				select_scope(path, dir, st, policy, scope);
+				if (scope.repo && (scope.repo != previous || !level)) {
+					found(*scope.repo);
 				}
 				scopes.push_back(std::move(scope));
 			} else if ((entry->fts_info == FTS_F || entry->fts_info == FTS_NSOK) &&
@@ -325,13 +562,14 @@ bool current(int fd, const Stamp &stamp)
 		Stamp(st).values == stamp.values;
 }
 
-Fd open_indexed(const string &path, const string &root, const string &repo, const Stamp &stamp)
+Fd open_indexed(const string &path, const string &root, const string &repo, const Stamp &stamp,
+	const ScanPolicy &policy)
 {
 	Fd dir = open_path(root, O_RDONLY | O_DIRECTORY);
 	struct stat st {};
 	const auto name = std::string_view(root).substr(root.find_last_of('/') + 1);
 	if (fstat(dir, &st) < 0 || identity(st) != repo ||
-		(!artifact_directory(name) && !git_repository(dir))) {
+		(!policy.storage_scope(root) && !git_repository(dir) && !artifact_directory(name, dir))) {
 		return {};
 	}
 
@@ -437,16 +675,38 @@ Integer unix_time()
 		std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+struct DedupEvent {
+	Integer at;
+	string source, destination;
+	uint64_t bytes;
+};
+
 struct Activity {
 	string phase = "stopped";
+	string scan_kind = "full", scan_root;
 	Integer phase_started_at = unix_time();
 	Integer repositories = 0, scanned_files = 0, hashed_files = 0, indexed_chunks = 0;
 	Integer processed_files = 0, matched_ranges = 0, rejected_ranges = 0, next_scan_at = 0;
 };
 
 // Publish a complete snapshot so readers can open it during any index transaction.
-void publish_stats(sqlite3 *sql, const string &state, const Activity &activity)
+void publish_stats(sqlite3 *sql, const string &state, const Activity &activity,
+	const std::vector<DedupEvent> &events)
 {
+	// SQLite handles JSON escaping, including paths with quotes or newlines.
+	Statement event_json(sql, "SELECT json_object('at',?,'source',CAST(? AS TEXT),"
+		"'destination',CAST(? AS TEXT),'bytes',?)");
+	string recent = "[";
+	for (const auto &event : events) {
+		if (recent.size() > 1) {
+			recent += ',';
+		}
+		event_json.bind(1, event.at).bind(2, event.source).bind(3, event.destination)
+			.bind(4, event.bytes).next();
+		recent += event_json.bytes(0);
+		event_json.reset();
+	}
+	recent += ']';
 	Statement snapshot(sql, R"SQL(
 		WITH credit(path, dest_bytes, source_bytes) AS (
 			SELECT path, 0, 0 FROM repositories
@@ -469,7 +729,9 @@ void publish_stats(sqlite3 *sql, const string &state, const Activity &activity)
 			'activity', json_object(
 				'phase', CAST(? AS TEXT), 'phaseStartedAt', ?,
 				'repositories', ?, 'scannedFiles', ?, 'hashedFiles', ?, 'indexedChunks', ?,
-				'processedFiles', ?, 'matchedRanges', ?, 'rejectedRanges', ?, 'nextScanAt', ?),
+				'processedFiles', ?, 'matchedRanges', ?, 'rejectedRanges', ?, 'nextScanAt', ?,
+				'scanKind', CAST(? AS TEXT), 'scanRoot', CAST(? AS TEXT)),
+			'recentEvents', json(CAST(? AS TEXT)),
 			'projects', json((SELECT json_group_array(json_object(
 				'path', CAST(path AS TEXT), 'bytes', bytes, 'sourceBytes', source_bytes)) FROM projects)),
 			'pairs', json((SELECT json_group_array(json_object(
@@ -480,7 +742,8 @@ void publish_stats(sqlite3 *sql, const string &state, const Activity &activity)
 		.bind(3, activity.repositories).bind(4, activity.scanned_files)
 		.bind(5, activity.hashed_files).bind(6, activity.indexed_chunks)
 		.bind(7, activity.processed_files).bind(8, activity.matched_ranges)
-		.bind(9, activity.rejected_ranges).bind(10, activity.next_scan_at).next();
+		.bind(9, activity.rejected_ranges).bind(10, activity.next_scan_at)
+		.bind(11, activity.scan_kind).bind(12, activity.scan_root).bind(13, recent).next();
 	auto data = json_utf8(snapshot.bytes(0));
 	data.push_back('\n');
 	string temp = state + "/.stats.XXXXXX";
@@ -501,11 +764,13 @@ class Index {
 	Fd lock;
 	std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db {nullptr, sqlite3_close};
 	const string state;
+	const ScanPolicy &policy;
 	Activity activity;
+	std::vector<DedupEvent> recent_events;
 
 	void exec(const char *sql) { check(sqlite3_exec(db.get(), sql, nullptr, nullptr, nullptr), db.get()); }
 
-	void publish() { publish_stats(db.get(), state, activity); }
+	void publish() { publish_stats(db.get(), state, activity, recent_events); }
 
 	void phase(const string &name, long delay = 0)
 	{
@@ -516,7 +781,7 @@ class Index {
 	}
 
 public:
-	explicit Index(const string &directory) : state(directory)
+	Index(const string &directory, const ScanPolicy &scan_policy) : state(directory), policy(scan_policy)
 	{
 		lock = open((state + "/lock").c_str(), O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_RDWR, 0600);
 		if (!lock || flock(lock, LOCK_EX | LOCK_NB) < 0) {
@@ -546,9 +811,12 @@ public:
 		publish();
 	}
 
-	void scan(const std::vector<string> &roots)
+	void scan(const std::vector<string> &roots, bool complete = true,
+		const std::vector<string> *complete_roots = nullptr)
 	{
 		activity = Activity {};
+		activity.scan_kind = complete ? "full" : "priority";
+		activity.scan_root = !complete && roots.size() == 1 ? roots.front() : "";
 		phase("scanning");
 		auto *sql = db.get();
 		// Keep scan membership temporary so unchanged files do not rewrite the index.
@@ -572,9 +840,20 @@ public:
 		std::array<char, chunk_size> buffer;
 		const std::array<char, chunk_size> zeros {};
 		size_t batch = 0;
-		auto next_report = std::chrono::steady_clock::now() + std::chrono::minutes(1);
+		auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		auto report_scan = [&]() {
+			const auto now = std::chrono::steady_clock::now();
+			if (now >= next_report) {
+				publish();
+				std::cout << "scanning repositories=" << activity.repositories
+					<< " scanned_files=" << activity.scanned_files
+					<< " hashed_files=" << activity.hashed_files
+					<< " indexed_chunks=" << activity.indexed_chunks << std::endl;
+				next_report = now + std::chrono::seconds(10);
+			}
+		};
 		exec("BEGIN");
-		walk(roots, state, [&](const Repository &repo) {
+		walk(roots, state, policy, [&](const Repository &repo) {
 			add_repo.bind(1, repo.path).bind(2, round).run();
 			++activity.repositories;
 		},
@@ -586,14 +865,7 @@ public:
 			if (++batch == 512) {
 				exec("COMMIT");
 				batch = 0;
-				const auto now = std::chrono::steady_clock::now();
-				if (now >= next_report) {
-					publish();
-					std::cout << "scanning repositories=" << activity.repositories
-						<< " hashed_files=" << activity.hashed_files
-						<< " indexed_chunks=" << activity.indexed_chunks << std::endl;
-					next_report = now + std::chrono::minutes(1);
-				}
+				report_scan();
 				exec("BEGIN");
 			}
 			const Stamp stamp(st);
@@ -643,6 +915,7 @@ public:
 					++activity.indexed_chunks;
 				}
 				offset += len;
+				report_scan();
 			}
 			if (!complete || !current(fd, stamp)) {
 				remove.bind(1, path).run();
@@ -650,9 +923,9 @@ public:
 				touch.bind(1, id).run();
 				++activity.hashed_files;
 			}
-		});
+		}, complete_roots);
 		// An interrupted walk has an incomplete membership set and must not prune.
-		if (!stopping) {
+		if (complete && !stopping) {
 			Statement prune(sql, "DELETE FROM files WHERE id IN ("
 				" SELECT id FROM files INDEXED BY files_pending"
 				" WHERE id NOT IN (SELECT id FROM scan_seen))");
@@ -666,7 +939,7 @@ public:
 			<< " indexed_chunks=" << activity.indexed_chunks << (stopping ? " interrupted" : "") << std::endl;
 	}
 
-	void dedup()
+	void dedup(bool partial = false)
 	{
 		phase("deduplicating");
 		auto *sql = db.get();
@@ -677,11 +950,15 @@ public:
 			// Snapshot each new content key once. The repository bounds tell us
 			// whether any new copy belongs to a different repository.
 			// CROSS JOIN keeps this incremental lookup driven by the new keys.
-			exec(R"SQL(
+			const string fresh_input = partial ?
+				"scan_seen picked CROSS JOIN files f INDEXED BY files_pending ON f.id=picked.id"
+				" CROSS JOIN chunks added ON added.file=f.id" :
+				"files f JOIN chunks added ON added.file=f.id";
+			const string wake = R"SQL(
 				WITH fresh AS MATERIALIZED (
 					SELECT added.hash, added.length, f.fsid,
 						min(f.repo) AS first_repo, max(f.repo) AS last_repo
-					FROM files f JOIN chunks added ON added.file=f.id
+					FROM )SQL" + fresh_input + R"SQL(
 					WHERE f.pending=1 GROUP BY added.hash, added.length, f.fsid
 				)
 				UPDATE files SET pending=1 WHERE id IN (
@@ -691,9 +968,14 @@ public:
 					WHERE old.pending=0 AND old.fsid=fresh.fsid
 						AND (old.repo<>fresh.first_repo OR old.repo<>fresh.last_repo)
 				)
-			)SQL");
+			)SQL";
+			exec(wake.c_str());
 		}
-		Statement pending(sql, "SELECT id,path,root,repo,fsid,device,inode,size,msec,mnsec,csec,cnsec"
+		Statement pending(sql, partial ?
+			"SELECT f.id,f.path,f.root,f.repo,f.fsid,f.device,f.inode,f.size,f.msec,f.mnsec,f.csec,f.cnsec"
+			" FROM scan_seen picked CROSS JOIN files f INDEXED BY files_pending ON f.id=picked.id"
+			" WHERE picked.id>? AND f.pending=1 ORDER BY picked.id LIMIT 1" :
+			"SELECT id,path,root,repo,fsid,device,inode,size,msec,mnsec,csec,cnsec"
 			" FROM files WHERE pending=1 AND id>? ORDER BY id LIMIT 1");
 		Statement chunks(sql, "SELECT start,length,hash FROM chunks WHERE file=?");
 		Statement sources(sql, "SELECT f.id,f.path,f.root,f.repo,f.device,f.inode,f.size,"
@@ -724,7 +1006,8 @@ public:
 			const auto repo = pending.bytes(3);
 			const auto fsid = pending.bytes(4);
 			const Stamp dest_stamp(pending, 5);
-			const Fd dest = open_indexed(pending.bytes(1), root, repo, dest_stamp);
+			const auto destination_path = pending.bytes(1);
+			const Fd dest = open_indexed(destination_path, root, repo, dest_stamp, policy);
 			pending.reset();
 			bool retry = false;
 			if (static_cast<int>(dest) >= 0) {
@@ -743,7 +1026,7 @@ public:
 						if (source_id != sources.number(0)) {
 							source_id = sources.number(0);
 							source = open_indexed(sources.bytes(1), sources.bytes(2),
-								sources.bytes(3), Stamp(sources, 4));
+								sources.bytes(3), Stamp(sources, 4), policy);
 						}
 						if (!source) {
 							continue;
@@ -802,6 +1085,17 @@ public:
 							if (added && current(dest, dest_stamp)) {
 								record.bind(1, sources.bytes(2)).bind(2, root).bind(3, added).run();
 								shared += added;
+								const auto source_path = sources.bytes(1);
+								if (!recent_events.empty() && recent_events.back().source == source_path &&
+									recent_events.back().destination == destination_path) {
+									recent_events.back().at = unix_time();
+									recent_events.back().bytes += added;
+								} else {
+									if (recent_events.size() == 32) {
+										recent_events.erase(recent_events.begin());
+									}
+									recent_events.push_back({unix_time(), source_path, destination_path, added});
+								}
 							}
 							bytes += accepted;
 							++activity.matched_ranges;
@@ -823,11 +1117,14 @@ public:
 			if (!stopping) {
 				++activity.processed_files;
 			}
-			if (++batch == 512) {
+			const auto now = std::chrono::steady_clock::now();
+			if (++batch == 512 || now >= next_report) {
 				exec("COMMIT");
-				const auto now = std::chrono::steady_clock::now();
 				if (now >= next_report) {
 					publish();
+					std::cout << "deduplicating processed_files=" << activity.processed_files
+						<< " matched_ranges=" << activity.matched_ranges
+						<< " newly_shared_bytes=" << shared << std::endl;
 					next_report = now + std::chrono::seconds(10);
 				}
 				exec("BEGIN");
@@ -851,7 +1148,7 @@ public:
 string state_directory()
 {
 	const auto *state = std::getenv("XDG_STATE_HOME");
-	if (state && *state) {
+	if (state && *state == '/') {
 		return string(state) + "/project-bees";
 	}
 	const auto *home = std::getenv("HOME");
@@ -865,12 +1162,13 @@ string state_directory()
 
 int main(int argc, char **argv)
 try {
-	std::vector<string> roots;
+	std::vector<string> roots, priority_roots;
 	string state;
 	bool once = false, discover = false, stats = false;
 	long interval = 300;
 	const option options[] = {
 		{"root", required_argument, nullptr, 'r'},
+		{"priority-root", required_argument, nullptr, 'p'},
 		{"state-dir", required_argument, nullptr, 's'},
 		{"interval", required_argument, nullptr, 'i'},
 		{"once", no_argument, nullptr, '1'},
@@ -879,12 +1177,18 @@ try {
 		{"help", no_argument, nullptr, 'h'},
 		{nullptr, 0, nullptr, 0},
 	};
-	for (int opt; (opt = getopt_long(argc, argv, "r:s:i:1dth", options, nullptr)) != -1;) {
+	for (int opt; (opt = getopt_long(argc, argv, "r:p:s:i:1dth", options, nullptr)) != -1;) {
 		switch (opt) {
 		case 'r':
 			roots.push_back(fs::canonical(optarg).string());
 			if (!fs::is_directory(roots.back())) {
 				throw std::runtime_error("--root expects a directory");
+			}
+			break;
+		case 'p':
+			priority_roots.push_back(fs::canonical(optarg).string());
+			if (!fs::is_directory(priority_roots.back())) {
+				throw std::runtime_error("--priority-root expects a directory");
 			}
 			break;
 		case 's': state = optarg; break;
@@ -901,9 +1205,12 @@ try {
 		case 't': stats = true; break;
 		case 'h':
 			std::cout << "Usage: project-bees [--root DIR]... [--state-dir DIR]\n"
+				"                    [--priority-root DIR]...\n"
 				"                    [--interval SECONDS] [--once | --discover | --stats]\n"
 				"Discover Git repositories and standalone build/dependency directories on mounted\n"
 				"writable Btrfs filesystems and deduplicate ranges across scopes.\n"
+				"Default system scans process build caches and user data directories first.\n"
+				"--priority-root adds an early directory pass within any --root limit.\n"
 				"The default interval is 300 seconds after each pass.\n"
 				"--stats prints the daemon's cumulative statistics as JSON.\n";
 			return 0;
@@ -925,15 +1232,35 @@ try {
 		std::cout << report.rdbuf();
 		return std::cout ? 0 : 1;
 	}
+	const ScanPolicy policy(priority_roots);
 	if (discover) {
-		walk(roots, state, [](const Repository &repo) { std::cout << repo.path << '\n'; },
+		walk(roots, state, policy, [](const Repository &repo) { std::cout << repo.path << '\n'; },
 			[](const Repository &, const string &, const struct stat &) {});
 		return 0;
 	}
 	fs::create_directories(state);
-	Index index(state);
+	Index index(state, policy);
 	std::cout << "project-bees running, scan interval=" << interval << "s" << std::endl;
 	while (!stopping) {
+		for (const auto &path : policy.priority_roots(roots)) {
+			// Explicitly limited scans keep their original single-pass behavior
+			// unless the caller requests an early pass as well.
+			if (!roots.empty() && std::find(priority_roots.begin(), priority_roots.end(), path) == priority_roots.end()) {
+				continue;
+			}
+			if (stopping) {
+				break;
+			}
+			std::cout << "priority scan root=" << path << std::endl;
+			index.scan({path}, false, &roots);
+			if (!stopping) {
+				index.dedup(true);
+			}
+		}
+		if (stopping) {
+			break;
+		}
+		std::cout << "full scan" << std::endl;
 		index.scan(roots);
 		if (!stopping) {
 			index.dedup();
