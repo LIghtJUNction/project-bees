@@ -3,6 +3,7 @@ name: Project Bees Btrfs tests
 on:
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -17,7 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 2
+          persist-credentials: false
+      - name: Verify the release workflow against a temporary Git remote
+        run: python3 test/project-bees-release.py
       - name: Install build and filesystem tools
         run: |
           sudo apt-get update
