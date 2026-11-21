@@ -55,7 +55,7 @@ class ReleaseTest(unittest.TestCase):
             "    if reject.exists():\n"
             "        sys.exit(1)\n"
             "    url = 'https://example.invalid/releases/' + args[2]\n"
-            "    release.write_text(url + '\\tfalse\\tfalse')\n"
+            "    release.write_text(args[2] + '\\t' + url + '\\tfalse\\tfalse')\n"
             "    print(url)\n"
             "else:\n"
             "    sys.exit(2)\n"
@@ -76,10 +76,12 @@ class ReleaseTest(unittest.TestCase):
     def refs(self):
         return self.git("--git-dir", self.remote, "show-ref")
 
-    def run_release(self, bump="patch", run_id="42", tag=None):
+    def run_release(self, bump="patch", run_id="42", tag=None, recover=False):
         args = [sys.executable, str(SCRIPT), bump, self.source, run_id]
         if tag is not None:
             args.extend(("--publish-tag", tag, "--repo", REPO))
+        if recover:
+            args.append("--recover")
         return subprocess.run(args, cwd=self.checkout, env=self.env, capture_output=True, text=True)
 
     def assert_stopped(self, result, message):
@@ -133,24 +135,74 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual(self.git("--git-dir", self.remote, "tag", "--list"), "v0.1.5\nv1.0.0-rc.1")
         self.assertNotIn("release create", self.calls.read_text())
 
-    def test_rechecks_main_before_creating_a_release_on_retry(self):
+    def test_same_run_recovers_after_main_advances(self):
         self.reject_release.touch()
         self.assert_stopped(self.run_release(tag="v0.1.6"), "Release stopped")
         self.reject_release.unlink()
-        self.git("checkout", "-b", "new-main")
-        self.git("commit", "--allow-empty", "-m", "Concurrent main update")
-        self.git("checkout", "main")
-        self.move_main.touch()
-        self.assert_stopped(self.run_release(tag="v0.1.6"), "origin/main moved before")
+        self.git("commit", "--allow-empty", "-m", "New main tip")
+        self.git("push", "origin", "main")
+        self.git("checkout", "--detach", self.source)
+        before = self.refs()
+        result = self.run_release(tag="v0.1.6", recover=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.refs(), before)
         self.assertEqual(self.git("--git-dir", self.remote, "rev-parse", "v0.1.6^{}"), self.source)
-        self.assertFalse(self.release.exists())
-        self.assertEqual(self.calls.read_text().count("release create v0.1.6"), 1)
+        self.assertTrue(self.release.exists())
+        self.assertEqual(self.calls.read_text().count("release create v0.1.6"), 2)
+
+    def test_new_run_cannot_skip_unfinished_release(self):
+        self.reject_release.touch()
+        self.assert_stopped(self.run_release(tag="v0.1.6"), "Release stopped")
+        self.git("commit", "--allow-empty", "-m", "New main tip")
+        self.git("push", "origin", "main")
+        self.source = self.git("rev-parse", "HEAD")
+        before = self.refs()
+        self.assert_stopped(self.run_release(run_id="43", tag="v0.1.7"), "Unfinished release v0.1.6")
+        self.assertEqual(self.refs(), before)
+        self.assertEqual(self.calls.read_text().count("release create"), 1)
+
+    def test_rejects_external_tag_on_the_original_source(self):
+        self.git("tag", "-a", "v0.1.6", "-m", "Manually created")
+        self.git("push", "origin", "refs/tags/v0.1.6")
+        self.git("commit", "--allow-empty", "-m", "New main tip")
+        self.git("push", "origin", "main")
+        self.git("checkout", "--detach", self.source)
+        before = self.refs()
+        self.assert_stopped(self.run_release(tag="v0.1.6", recover=True), "requires an existing workflow tag")
+        self.assertEqual(self.refs(), before)
+        self.assertFalse(self.calls.exists())
+
+    def test_retry_never_creates_a_missing_tag(self):
+        before = self.refs()
+        self.assert_stopped(self.run_release(tag="v0.1.6", recover=True), "requires an existing workflow tag")
+        self.assertEqual(self.refs(), before)
+        self.assertFalse(self.calls.exists())
+
+    def test_rejects_run_marker_on_another_source(self):
+        self.git("tag", "-a", "v0.1.6", "HEAD^", "-m", "Project Bees release workflow run 42")
+        self.git("push", "origin", "refs/tags/v0.1.6")
+        before = self.refs()
+        self.assert_stopped(self.run_release(tag="v0.1.6", recover=True), "does not match the dispatch commit")
+        self.assertEqual(self.refs(), before)
+        self.assertFalse(self.calls.exists())
+
+    def test_rejects_tag_outside_current_main_history(self):
+        self.reject_release.touch()
+        self.assert_stopped(self.run_release(tag="v0.1.6"), "Release stopped")
+        self.git("checkout", "--detach", "HEAD^")
+        self.git("commit", "--allow-empty", "-m", "Rewritten main")
+        self.git("push", "origin", "+HEAD:refs/heads/main")
+        self.git("checkout", "--detach", self.source)
+        before = self.refs()
+        self.assert_stopped(self.run_release(tag="v0.1.6", recover=True), "outside origin/main history")
+        self.assertEqual(self.refs(), before)
+        self.assertEqual(self.calls.read_text().count("release create"), 1)
 
     def test_rejects_changed_plan_and_existing_draft(self):
         before = self.refs()
         self.assert_stopped(self.run_release(tag="v0.1.7"), "Planned tag changed")
         self.assertFalse(self.calls.exists())
-        self.release.write_text("https://example.invalid/draft\ttrue\tfalse")
+        self.release.write_text("v0.1.6\thttps://example.invalid/draft\ttrue\tfalse")
         self.assert_stopped(self.run_release(tag="v0.1.6"), "already exists on GitHub")
         self.assertEqual(self.refs(), before)
         self.assertNotIn("release create", self.calls.read_text())
@@ -162,11 +214,11 @@ class ReleaseTest(unittest.TestCase):
         self.assertEqual(self.git("--git-dir", self.remote, "rev-parse", "main"), self.source)
         self.assertEqual(self.git("--git-dir", self.remote, "rev-parse", "v0.1.6^{}"), self.source)
         self.assertFalse(self.release.exists())
-        self.assert_stopped(self.run_release(run_id="43", tag="v0.1.6"), "already has a stable version tag")
+        self.assert_stopped(self.run_release(run_id="43", tag="v0.1.6", recover=True), "different release workflow run")
 
         self.reject_release.unlink()
         for _ in range(2):
-            result = self.run_release(tag="v0.1.6")
+            result = self.run_release(tag="v0.1.6", recover=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "v0.1.6")
         self.assertEqual(self.refs(), after_tag)
