@@ -1,8 +1,9 @@
 # project-bees
 
 `project-bees` is a fork of [Zygo/bees](https://github.com/Zygo/bees) that
-shares identical Btrfs file ranges across local Git repositories. It runs as a
-regular user and uses the upstream CityHash and Btrfs extent-same code. Btrfs
+shares identical Btrfs file ranges across local Git repositories and standalone
+`target` and `node_modules` directories. It runs as a regular user and uses the
+upstream CityHash and Btrfs extent-same code. Btrfs
 compares the data in the kernel before sharing storage. Subsequent writes use
 copy-on-write.
 
@@ -54,7 +55,7 @@ bin/project-bees --discover
 bin/project-bees --once
 ```
 
-`--discover` lists the discovered repository roots without creating an index.
+`--discover` lists the discovered scope roots without creating an index.
 `--once` performs one scan and deduplication pass. With neither flag the daemon
 waits five minutes after each pass, then picks up new repositories, changed
 files, and deletions. Use `--interval SECONDS` to change that delay, or repeat
@@ -132,7 +133,7 @@ statistics above keep their history.
 | --- | --- |
 | `phase` | `scanning`, `deduplicating`, `idle`, or `stopped` |
 | `phaseStartedAt` | Time this phase began, as Unix seconds |
-| `repositories` | Repository visits in the current scan |
+| `repositories` | Git or standalone build/dependency scope visits in the current scan |
 | `scannedFiles` | Eligible file visits in the current scan, including cached files |
 | `hashedFiles` | Files successfully read and indexed in this scan |
 | `indexedChunks` | Nonzero chunks hashed in this scan |
@@ -157,13 +158,37 @@ repeated restarts delay its first deduplication stage.
 
 ## Scope and resource use
 
+The index keeps 128 KiB content hashes and combines consecutive matches from
+the same source into requests of at most 1 MiB. Btrfs verifies each request's
+contents. If a combined range is rejected, the daemon retries its first
+128 KiB chunk before trying another source. Gaps or a change in the selected
+source end a combined range. Repeated chunks retain the same first source
+selection as individual requests. Range counters count accepted requests;
+byte counters continue to measure newly shared logical bytes.
+
+During incremental passes, new content keys are grouped before matching old
+files. Many identical new blocks therefore share one candidate lookup. The
+set of new files is fixed for that lookup, so waking an old file does not
+recursively wake other files. All existing index and cumulative statistics
+remain compatible.
+
+Unchanged files are recorded in a temporary integer-ID set during scanning.
+Their persistent index rows are left untouched. A completed scan prunes
+missing or ineligible files through the small file-ID index; an interrupted
+scan keeps unseen rows for the next pass. This avoids rewriting every file's
+metadata on each pass while preserving cached content hashes.
+
 - The discovery pass walks accessible directories on mounted, writable
   Btrfs filesystems. It detects regular Git checkouts, linked worktrees,
   submodules and bare repositories, and gives nested repositories their own
   scope. Symlinks, hard-linked files and read-only subvolumes are skipped.
-- Tracked, untracked and ignored regular files inside those repositories can
+- A `target` or `node_modules` directory outside a discovered scope becomes
+  its own scope. Inside a Git repository, build and dependency files retain
+  that repository's scope. Nested dependency directories stay in the outer
+  scope. Ordinary files outside these scopes remain excluded.
+- Tracked, untracked and ignored regular files inside these scopes can
   participate, including Git metadata physically located there. Each match
-  must span two distinct repository roots on the same Btrfs filesystem.
+  must span two distinct scope roots on the same Btrfs filesystem.
 - The disk-backed SQLite index caches file metadata and hashes across restarts.
   SQLite's page-cache target is 8 MiB. The first pass hashes existing files.
   Later passes enumerate repository files and rehash new or changed files.
@@ -181,8 +206,26 @@ Run `make test-project-bees` from a Btrfs checkout, or set
 physical extent sharing, content preservation, repository scope, and live
 discovery of additions and edits. It also checks cumulative totals, restart
 persistence, repeat-scan accounting, and statistics for non-UTF-8 repository
-names, plus activity counters and phase transitions. `make test` runs the
-upstream unit tests.
+names, plus activity counters and phase transitions. It also covers combined
+ranges and their size limit, mismatched offsets, sparse holes, hash-collision
+fallback, and incremental candidate selection. `make test` runs the upstream
+unit tests. The GitHub workflow runs the Btrfs suite on an isolated loopback
+filesystem.
+
+To compare two executable versions on the same writable Btrfs filesystem:
+
+```sh
+python3 test/project-bees-benchmark.py --before /path/to/old/project-bees \
+  --after bin/project-bees --directory /path/on/btrfs --repeats 3
+```
+
+The benchmark creates and removes its own temporary repositories and indexes.
+It measures both a first pass over identical contiguous files and an
+incremental pass with many repeated blocks. Each version receives independent
+copies of the same data; content checks and shared-byte totals must agree.
+JSON output includes per-run timings, kernel request counters, and medians.
+Timings depend on the filesystem and host load, so they are reported without
+a fixed pass/fail speed threshold.
 
 The [upstream documentation](https://zygo.github.io/bees/) describes the
 original filesystem-wide daemon. This fork retains the upstream source and

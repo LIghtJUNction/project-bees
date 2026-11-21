@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import struct
 import subprocess
@@ -13,6 +14,7 @@ import time
 
 
 BINARY = Path(__file__).resolve().parents[1] / "bin" / "project-bees"
+CHUNK_SIZE = 128 * 1024
 FIEMAP = 0xC020660B
 FIEMAP_EXTENT_SHARED = 0x2000
 
@@ -47,6 +49,30 @@ def shared(source, dest):
                 if rest[2] & FIEMAP_EXTENT_SHARED]
 
     return bool(layout(source)) and layout(source) == layout(dest)
+
+
+def shared_range(source, source_offset, dest, dest_offset, length):
+    def layout(path, offset):
+        result = []
+        covered = offset
+        for extent in extents(path):
+            logical, physical, size = extent[:3]
+            begin = max(offset, logical)
+            end = min(offset + length, logical + size)
+            if begin >= end:
+                continue
+            if begin != covered or not physical or not extent[5] & FIEMAP_EXTENT_SHARED:
+                return None
+            address = physical + begin - logical
+            if result and result[-1][0] + result[-1][1] == address:
+                result[-1] = (result[-1][0], result[-1][1] + end - begin)
+            else:
+                result.append((address, end - begin))
+            covered = end
+        return result if covered == offset + length else None
+
+    source_layout = layout(source, source_offset)
+    return source_layout is not None and source_layout == layout(dest, dest_offset)
 
 
 def digest(path):
@@ -246,6 +272,281 @@ def test_stats_encoding(root):
     print("Passed UTF-8 statistics, JSON escaping, exact path keys, and repeat-scan accounting")
 
 
+def make_repositories(root, name, names=("a", "b")):
+    scan = root / name
+    scan.mkdir()
+    template = root / "empty-template"
+    template.mkdir(exist_ok=True)
+    repositories = [scan / name for name in names]
+    for repository in repositories:
+        git("init", "-q", f"--template={template}", repository)
+    return scan, root / (name + "-state"), repositories
+
+
+def run_once(scan, state, expected=None):
+    process = subprocess.run(
+        [BINARY, "--root", scan, "--state-dir", state, "--once"],
+        text=True, capture_output=True,
+    )
+    assert process.returncode == 0, process.stdout + process.stderr
+    report = json.loads(subprocess.check_output([BINARY, "--state-dir", state, "--stats"]))
+    check_activity(report, "stopped")
+    total = report["totalBytes"]
+    if expected is not None:
+        assert total == expected, (report, process.stdout)
+    assert sum(project["bytes"] for project in report["projects"]) == total
+    assert sum(project["sourceBytes"] for project in report["projects"]) == total
+    assert sum(pair["bytes"] for pair in report["pairs"]) == total
+    return report
+
+
+def test_coalesced_ranges(root):
+    scan, state, (a, b) = make_repositories(root, "coalesced")
+    content = os.urandom(2 * 1024 * 1024 + 22133)
+    source = put(a / "common", content)
+    dest = put(b / "common", content)
+    report = run_once(scan, state, len(content))
+    assert source.read_bytes() == dest.read_bytes() == content
+    assert shared_range(source, 0, dest, 0, len(content)), report
+    assert report["activity"]["matchedRanges"] == 6, report
+    assert report["activity"]["rejectedRanges"] == 0, report
+    assert report["rangeCount"] == 3, report
+    os.utime(source, None)
+    repeated = run_once(scan, state, len(content))
+    assert repeated["rangeCount"] == report["rangeCount"], repeated
+    assert repeated["startedAt"] == report["startedAt"], repeated
+    assert repeated["activity"]["hashedFiles"] == 1, repeated
+    assert source.read_bytes() == dest.read_bytes() == content
+    print("Passed bounded range coalescing, tail accounting, and shared-range rescanning")
+
+
+def test_shifted_and_sparse_ranges(root):
+    scan, state, (a, b) = make_repositories(root, "shifted")
+    p, x, y, z, q = (os.urandom(CHUNK_SIZE) for _ in range(5))
+    source_content = p + x + y + z
+    dest_content = x + y + z + q
+    source = put(a / "shifted", source_content)
+    dest = put(b / "shifted", dest_content)
+    report = run_once(scan, state, 3 * CHUNK_SIZE)
+    assert source.read_bytes() == source_content
+    assert dest.read_bytes() == dest_content
+    assert shared_range(source, CHUNK_SIZE, dest, 0, 3 * CHUNK_SIZE), report
+    assert report["activity"]["matchedRanges"] == 2, report
+    assert report["activity"]["rejectedRanges"] == 0, report
+    assert report["rangeCount"] == 1, report
+
+    scan, state, (a, b) = make_repositories(root, "sparse-ranges")
+    p, x, y, z, q, r = (os.urandom(CHUNK_SIZE) for _ in range(6))
+    source = a / "sparse"
+    with source.open("wb") as output:
+        output.write(x)
+        output.seek(2 * CHUNK_SIZE)
+        output.write(y + z)
+        output.flush()
+        os.fsync(output.fileno())
+    source_content = x + bytes(CHUNK_SIZE) + y + z
+    dest_content = p + x + q + y + z + r
+    dest = put(b / "gapped", dest_content)
+    report = run_once(scan, state, 3 * CHUNK_SIZE)
+    assert source.read_bytes() == source_content
+    assert dest.read_bytes() == dest_content
+    assert shared_range(source, 0, dest, CHUNK_SIZE, CHUNK_SIZE), report
+    assert shared_range(source, 2 * CHUNK_SIZE, dest, 3 * CHUNK_SIZE, 2 * CHUNK_SIZE), report
+    assert not shared_range(source, CHUNK_SIZE, dest, 2 * CHUNK_SIZE, CHUNK_SIZE), report
+    assert report["activity"]["matchedRanges"] == 4, report
+    # Crossing the source hole would compare zeroes with q and be rejected.
+    assert report["activity"]["rejectedRanges"] == 0, report
+    assert report["rangeCount"] == 2, report
+    print("Passed shifted ranges, sparse gaps, and preservation of unmatched content")
+
+
+def test_coalesced_hash_collision(root):
+    scan, state, (a, b) = make_repositories(root, "hash-collision")
+    x, y, q, z = (os.urandom(CHUNK_SIZE) for _ in range(4))
+    source = put(a / "source", x + y)
+    dest = put(b / "dest", q + z)
+    run_once(scan, state, 0)
+    source_stamp = source.stat()
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        target_hash = db.execute(
+            "SELECT c.hash FROM chunks c JOIN files f ON f.id=c.file WHERE f.path=? AND c.start=?",
+            (os.fsencode(dest), CHUNK_SIZE),
+        ).fetchone()[0]
+        changed = db.execute(
+            "UPDATE chunks SET hash=? WHERE file=(SELECT id FROM files WHERE path=?) AND start=?",
+            (target_hash, os.fsencode(source), CHUNK_SIZE),
+        ).rowcount
+        assert changed == 1
+    put(dest, x + z)
+    assert (source.stat().st_mtime_ns, source.stat().st_ctime_ns) == (
+        source_stamp.st_mtime_ns, source_stamp.st_ctime_ns,
+    )
+    report = run_once(scan, state, CHUNK_SIZE)
+    assert source.read_bytes() == x + y
+    assert dest.read_bytes() == x + z
+    assert shared_range(source, 0, dest, 0, CHUNK_SIZE), report
+    assert not shared_range(source, CHUNK_SIZE, dest, CHUNK_SIZE, CHUNK_SIZE), report
+    assert report["activity"]["hashedFiles"] == 1, report
+    assert report["activity"]["rejectedRanges"] > 0, report
+    assert report["rangeCount"] == 1, report
+    print("Passed collision rejection and single-chunk fallback after a failed merged range")
+
+
+def test_nontransitive_pending(root):
+    scan, state, (a, b) = make_repositories(root, "pending-snapshot")
+    x, y = (os.urandom(CHUNK_SIZE) for _ in range(2))
+    a_file = put(a / "xy", x + y)
+    b_file = put(b / "y", y)
+    run_once(scan, state, CHUNK_SIZE)
+    assert shared_range(a_file, CHUNK_SIZE, b_file, 0, CHUNK_SIZE)
+    c = scan / "c"
+    git("init", "-q", f"--template={root / 'empty-template'}", c)
+    c_file = put(c / "x", x)
+    report = run_once(scan, state, 2 * CHUNK_SIZE)
+    assert report["activity"]["hashedFiles"] == 1, report
+    assert report["activity"]["processedFiles"] == 2, report
+    assert shared_range(a_file, 0, c_file, 0, CHUNK_SIZE), report
+    assert shared_range(a_file, CHUNK_SIZE, b_file, 0, CHUNK_SIZE), report
+    assert a_file.read_bytes() == x + y
+    assert b_file.read_bytes() == y
+    assert c_file.read_bytes() == x
+    print("Passed fixed fresh-file snapshot without transitive pending expansion")
+
+
+def test_repeated_block_convergence(root):
+    scan, state, (a, b) = make_repositories(root, "repeated-block-convergence")
+    block = os.urandom(CHUNK_SIZE)
+    content = block * 16
+    source = put(a / "repeated", content)
+    dest = put(b / "repeated", content)
+    report = run_once(scan, state)
+    for path in (source, dest):
+        assert path.read_bytes() == content
+        for index in range(16):
+            assert shared_range(source, 0, path, index * CHUNK_SIZE, CHUNK_SIZE), (path, index, report)
+    print("Passed convergence of repeated blocks to one shared physical range")
+
+
+def test_cross_file_source_convergence(root):
+    scan, state, (a, b) = make_repositories(root, "cross-file-source-convergence")
+    x, y, z = (os.urandom(CHUNK_SIZE) for _ in range(3))
+    contents = {
+        a / "a1": x + y,
+        a / "a2": z + y,
+        b / "b1": z + y,
+        b / "b2": x + y,
+    }
+    for path, content in contents.items():
+        put(path, content)
+    report = run_once(scan, state)
+    for path, content in contents.items():
+        assert path.read_bytes() == content
+        assert shared_range(a / "a1", CHUNK_SIZE, path, CHUNK_SIZE, CHUNK_SIZE), (path, report)
+    assert shared_range(a / "a1", 0, b / "b2", 0, CHUNK_SIZE), report
+    assert shared_range(a / "a2", 0, b / "b1", 0, CHUNK_SIZE), report
+    print("Passed cross-file convergence when merged blocks have different first sources")
+
+
+def test_completed_scan_pruning(root):
+    scan, state, (a, b, c) = make_repositories(root, "scan-pruning", names=("a", "b", "c"))
+    files = [put(repository / name, os.urandom(CHUNK_SIZE))
+             for repository in (a, b, c) for name in ("one", "two")]
+    before = {path: digest(path) for path in files}
+    report = run_once(scan, state, 0)
+    assert report["activity"]["hashedFiles"] == 6, report
+    assert report["activity"]["repositories"] == 3, report
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert {row[0] for row in db.execute("SELECT path FROM files")} == {os.fsencode(path) for path in files}
+
+    removed = a / "one"
+    removed.unlink()
+    hardlink = root / "scan-pruning-hardlink"
+    os.link(a / "two", hardlink)
+    shutil.rmtree(c / ".git")
+    retained = {b / "one", b / "two"}
+    report = run_once(scan, state, 0)
+    activity = report["activity"]
+    assert activity["repositories"] == 2, activity
+    assert activity["scannedFiles"] == 2, activity
+    assert activity["hashedFiles"] == activity["processedFiles"] == 0, activity
+    assert {project["path"] for project in report["projects"]} == {str(a), str(b)}, report
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert {row[0] for row in db.execute("SELECT path FROM files")} == {os.fsencode(path) for path in retained}
+        assert {row[0] for row in db.execute("SELECT path FROM repositories")} == {os.fsencode(a), os.fsencode(b)}
+    assert {path: digest(path) for path in files if path != removed} == {
+        path: checksum for path, checksum in before.items() if path != removed
+    }
+    assert digest(hardlink) == before[a / "two"]
+
+    added = put(b / "new", os.urandom(CHUNK_SIZE))
+    added_digest = digest(added)
+    report = run_once(scan, state, 0)
+    activity = report["activity"]
+    assert activity["repositories"] == 2, activity
+    assert activity["scannedFiles"] == 3, activity
+    assert activity["hashedFiles"] == activity["processedFiles"] == 1, activity
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert {row[0] for row in db.execute("SELECT path FROM files")} == {
+            os.fsencode(path) for path in retained | {added}
+        }
+    assert all(digest(path) == before[path] for path in files if path != removed)
+    assert digest(added) == added_digest
+    assert digest(hardlink) == before[a / "two"]
+    print("Passed completed-scan pruning, unchanged-file retention, and subsequent incremental indexing")
+
+
+def test_artifact_discovery(root):
+    scan = root / "artifact-discovery"
+    scan.mkdir()
+    state = root / "artifact-discovery-state"
+    target = scan / "standalone" / "project" / "target"
+    modules = scan / "packages" / "node_modules"
+    nested_modules = modules / "pkg" / "node_modules" / "nested"
+    repository = scan / "git-repository"
+    plain = scan / "plain"
+    template = root / "empty-template"
+    template.mkdir(exist_ok=True)
+    git("init", "-q", f"--template={template}", repository)
+    (target / "debug").mkdir(parents=True)
+    nested_modules.mkdir(parents=True)
+    (repository / "target" / "debug").mkdir(parents=True)
+    plain.mkdir()
+    (scan / "target").symlink_to(target, target_is_directory=True)
+
+    content = os.urandom(CHUNK_SIZE)
+    target_file = put(target / "debug" / "common", content)
+    modules_file = put(nested_modules / "common", content)
+    repository_file = put(repository / "target" / "debug" / "common", content)
+    plain_file = put(plain / "common", content)
+    files = (target_file, modules_file, repository_file, plain_file)
+    before = {path: digest(path) for path in files}
+    expected_roots = {target, modules, repository}
+    discovered = subprocess.check_output(
+        [BINARY, "--root", scan, "--state-dir", state, "--discover"], text=True,
+    ).splitlines()
+    assert len(discovered) == 3 and set(discovered) == {str(path) for path in expected_roots}, discovered
+
+    report = run_once(scan, state, 2 * len(content))
+    assert report["activity"]["repositories"] == 3, report
+    assert report["activity"]["scannedFiles"] == report["activity"]["hashedFiles"] == 3, report
+    assert {project["path"] for project in report["projects"]} == {str(path) for path in expected_roots}, report
+    assert shared_range(target_file, 0, modules_file, 0, len(content)), report
+    assert shared_range(target_file, 0, repository_file, 0, len(content)), report
+    assert not shared_range(target_file, 0, plain_file, 0, len(content)), report
+    assert all((extent[5] & FIEMAP_EXTENT_SHARED) == 0 for extent in extents(plain_file))
+    assert {path: digest(path) for path in files} == before
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert set(db.execute("SELECT path,root FROM files")) == {
+            (os.fsencode(target_file), os.fsencode(target)),
+            (os.fsencode(modules_file), os.fsencode(modules)),
+            (os.fsencode(repository_file), os.fsencode(repository)),
+        }
+        assert {row[0] for row in db.execute("SELECT path FROM repositories")} == {
+            os.fsencode(path) for path in expected_roots
+        }
+    print("Passed standalone artifact discovery, nested scope ownership, and plain-directory exclusion")
+
+
 if __name__ == "__main__":
     test_parent = Path(os.environ.get("PROJECT_BEES_TEST_DIR", BINARY.parents[1])).resolve()
     fstype = subprocess.check_output(["stat", "-f", "-c", "%T", test_parent], text=True).strip()
@@ -254,3 +555,11 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="project-bees-test-", dir=test_parent) as directory:
         test(Path(directory))
         test_stats_encoding(Path(directory))
+        test_coalesced_ranges(Path(directory))
+        test_shifted_and_sparse_ranges(Path(directory))
+        test_coalesced_hash_collision(Path(directory))
+        test_nontransitive_pending(Path(directory))
+        test_repeated_block_convergence(Path(directory))
+        test_cross_file_source_convergence(Path(directory))
+        test_completed_scan_pruning(Path(directory))
+        test_artifact_discovery(Path(directory))

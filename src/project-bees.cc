@@ -35,6 +35,7 @@ using Integer = sqlite3_int64;
 namespace fs = std::filesystem;
 
 constexpr size_t chunk_size = 128 * 1024;
+constexpr Integer max_dedup_size = 1024 * 1024;
 volatile sig_atomic_t stopping = 0;
 
 void stop(int)
@@ -93,6 +94,11 @@ bool git_repository(int fd)
 	return git_directory(metadata) ||
 		(static_cast<int>(metadata) >= 0 && is_entry(metadata, "HEAD", S_IFREG) &&
 			is_entry(metadata, "commondir", S_IFREG));
+}
+
+bool artifact_directory(std::string_view name)
+{
+	return name == "target" || name == "node_modules";
 }
 
 string identity(const struct stat &st)
@@ -205,7 +211,8 @@ void walk(const std::vector<string> &requested, const string &state, VisitReposi
 				if (scope.repo && string(entry->fts_name) == ".git") {
 					scope.metadata = true;
 				}
-				if (!scope.metadata && git_repository(dir)) {
+				if (!scope.metadata && (git_repository(dir) ||
+					(!scope.repo && artifact_directory(entry->fts_name)))) {
 					crucible::BtrfsIoctlFsInfoArgs info;
 					if (info.do_ioctl_nothrow(dir) && info.sectorsize && info.sectorsize <= chunk_size) {
 						const auto uuid = info.fsid();
@@ -322,11 +329,13 @@ Fd open_indexed(const string &path, const string &root, const string &repo, cons
 {
 	Fd dir = open_path(root, O_RDONLY | O_DIRECTORY);
 	struct stat st {};
-	if (fstat(dir, &st) < 0 || identity(st) != repo || !git_repository(dir)) {
+	const auto name = std::string_view(root).substr(root.find_last_of('/') + 1);
+	if (fstat(dir, &st) < 0 || identity(st) != repo ||
+		(!artifact_directory(name) && !git_repository(dir))) {
 		return {};
 	}
 
-	// Open the member relative to the verified repository directory.
+	// Open the member relative to the verified scope directory.
 	Fd fd = open_path(path.substr(root == "/" ? 1 : root.size() + 1), O_RDONLY, dir);
 	return current(fd, stamp) && writable_btrfs(fd) ? fd : Fd {};
 }
@@ -363,21 +372,27 @@ uint64_t newly_shared(const Extents &before, int fd, uint64_t offset, uint64_t l
 
 	const auto after = extent_map(fd, offset, length);
 	uint64_t bytes = 0;
-	for (const auto &old : before) {
-		if (!allocated(old) || (old.fe_flags & FIEMAP_EXTENT_SHARED)) {
-			continue;
-		}
-		for (const auto &now : after) {
-			if (!allocated(now) || !(now.fe_flags & FIEMAP_EXTENT_SHARED)) {
-				continue;
-			}
+	size_t i = 0, j = 0;
+	while (i < before.size() && j < after.size()) {
+		const auto &old = before[i];
+		const auto &now = after[j];
+		const auto old_end = old.fe_logical + old.fe_length;
+		const auto new_end = now.fe_logical + now.fe_length;
+		if (allocated(old) && !(old.fe_flags & FIEMAP_EXTENT_SHARED) &&
+			allocated(now) && (now.fe_flags & FIEMAP_EXTENT_SHARED)) {
 			const auto start = std::max({offset, static_cast<uint64_t>(old.fe_logical),
 				static_cast<uint64_t>(now.fe_logical)});
-			const auto end = std::min({offset + length, static_cast<uint64_t>(old.fe_logical + old.fe_length),
-				static_cast<uint64_t>(now.fe_logical + now.fe_length)});
+			const auto end = std::min({offset + length, static_cast<uint64_t>(old_end),
+				static_cast<uint64_t>(new_end)});
 			if (end > start) {
 				bytes += end - start;
 			}
+		}
+		if (old_end <= new_end) {
+			++i;
+		}
+		if (new_end <= old_end) {
+			++j;
 		}
 	}
 	return bytes;
@@ -519,6 +534,7 @@ public:
 			" repo TEXT, fsid TEXT, seen INTEGER, pending INTEGER, device INTEGER, inode INTEGER,"
 			" size INTEGER, msec INTEGER, mnsec INTEGER, csec INTEGER, cnsec INTEGER);"
 			"CREATE INDEX IF NOT EXISTS files_pending ON files (pending, id);"
+			"CREATE TEMP TABLE scan_seen (id INTEGER PRIMARY KEY) WITHOUT ROWID;"
 			"CREATE TABLE IF NOT EXISTS chunks (file INTEGER REFERENCES files(id) ON DELETE CASCADE,"
 			" start INTEGER, length INTEGER, hash INTEGER, PRIMARY KEY(file, start)) WITHOUT ROWID;"
 			"CREATE INDEX IF NOT EXISTS chunk_match ON chunks (hash, length, file);"
@@ -535,15 +551,17 @@ public:
 		activity = Activity {};
 		phase("scanning");
 		auto *sql = db.get();
-		Statement latest(sql, "SELECT max(coalesce((SELECT max(seen) FROM files),0),"
-			" coalesce((SELECT max(seen) FROM repositories),0)) + 1");
+		// Keep scan membership temporary so unchanged files do not rewrite the index.
+		exec("DELETE FROM scan_seen");
+		// Repository epochs also work with an existing index; files.seen stays compatible.
+		Statement latest(sql, "SELECT coalesce(max(seen),0) + 1 FROM repositories");
 		latest.next();
 		const auto round = latest.number(0);
 		latest.reset();
 
 		Statement existing(sql, "SELECT id,root,repo,fsid,device,inode,size,msec,mnsec,csec,cnsec"
 			" FROM files WHERE path=?");
-		Statement touch(sql, "UPDATE files SET seen=? WHERE id=?");
+		Statement touch(sql, "INSERT OR IGNORE INTO scan_seen VALUES (?)");
 		Statement remove(sql, "DELETE FROM files WHERE path=?");
 		Statement add(sql, "INSERT INTO files(path,root,repo,fsid,seen,pending,device,inode,size,msec,mnsec,csec,cnsec)"
 			" VALUES(?,?,?,?,?,1,?,?,?,?,?,?,?)");
@@ -584,7 +602,7 @@ public:
 				existing.bytes(2) == repo.key && existing.bytes(3) == repo.fsid &&
 				stamp.values == Stamp(existing, 4).values;
 			if (unchanged) {
-				touch.bind(1, round).bind(2, existing.number(0)).run();
+				touch.bind(1, existing.number(0)).run();
 			}
 			existing.reset();
 			if (unchanged) {
@@ -629,12 +647,16 @@ public:
 			if (!complete || !current(fd, stamp)) {
 				remove.bind(1, path).run();
 			} else {
+				touch.bind(1, id).run();
 				++activity.hashed_files;
 			}
 		});
+		// An interrupted walk has an incomplete membership set and must not prune.
 		if (!stopping) {
-			Statement prune(sql, "DELETE FROM files WHERE seen<>?");
-			prune.bind(1, round).run();
+			Statement prune(sql, "DELETE FROM files WHERE id IN ("
+				" SELECT id FROM files INDEXED BY files_pending"
+				" WHERE id NOT IN (SELECT id FROM scan_seen))");
+			prune.run();
 			Statement prune_repositories(sql, "DELETE FROM repositories WHERE seen<>?");
 			prune_repositories.bind(1, round).run();
 		}
@@ -652,20 +674,40 @@ public:
 		const bool have_existing = has_existing.next();
 		has_existing.reset();
 		if (have_existing) {
-			// A new repository can make several existing files eligible for
-			// the first time, even if those files have not changed.
-			exec("UPDATE files SET pending=1 WHERE id IN ("
-				" SELECT old.id FROM files fresh JOIN chunks added ON added.file=fresh.id"
-				" JOIN chunks match ON match.hash=added.hash AND match.length=added.length"
-				" JOIN files old ON old.id=match.file"
-				" WHERE fresh.pending=1 AND old.pending=0 AND fresh.fsid=old.fsid AND fresh.repo<>old.repo)");
+			// Snapshot each new content key once. The repository bounds tell us
+			// whether any new copy belongs to a different repository.
+			// CROSS JOIN keeps this incremental lookup driven by the new keys.
+			exec(R"SQL(
+				WITH fresh AS MATERIALIZED (
+					SELECT added.hash, added.length, f.fsid,
+						min(f.repo) AS first_repo, max(f.repo) AS last_repo
+					FROM files f JOIN chunks added ON added.file=f.id
+					WHERE f.pending=1 GROUP BY added.hash, added.length, f.fsid
+				)
+				UPDATE files SET pending=1 WHERE id IN (
+					SELECT old.id FROM fresh
+					CROSS JOIN chunks match ON match.hash=fresh.hash AND match.length=fresh.length
+					CROSS JOIN files old ON old.id=match.file
+					WHERE old.pending=0 AND old.fsid=fresh.fsid
+						AND (old.repo<>fresh.first_repo OR old.repo<>fresh.last_repo)
+				)
+			)SQL");
 		}
 		Statement pending(sql, "SELECT id,path,root,repo,fsid,device,inode,size,msec,mnsec,csec,cnsec"
 			" FROM files WHERE pending=1 AND id>? ORDER BY id LIMIT 1");
 		Statement chunks(sql, "SELECT start,length,hash FROM chunks WHERE file=?");
 		Statement sources(sql, "SELECT f.id,f.path,f.root,f.repo,f.device,f.inode,f.size,"
 			" f.msec,f.mnsec,f.csec,f.cnsec,c.start FROM chunks c JOIN files f ON f.id=c.file"
-			" WHERE c.hash=? AND c.length=? AND f.fsid=? AND f.repo<>? ORDER BY c.file");
+			" WHERE c.hash=? AND c.length=? AND f.fsid=? AND f.repo<>? ORDER BY c.file,c.start");
+		Statement consecutive(sql, R"SQL(
+			SELECT d.start, d.length, s.hash=d.hash AND s.length=d.length AND NOT EXISTS (
+				SELECT 1 FROM chunks earlier JOIN files f ON f.id=earlier.file
+				WHERE earlier.hash=d.hash AND earlier.length=d.length AND earlier.file<=s.file
+					AND (earlier.file<s.file OR earlier.start<s.start) AND f.fsid=?7 AND f.repo<>?8
+			)
+			FROM chunks d LEFT JOIN chunks s ON s.file=?1 AND s.start=?2+(d.start-?3)
+			WHERE d.file=?4 AND d.start>=?5 AND d.start<?6 ORDER BY d.start
+		)SQL");
 		Statement done(sql, "UPDATE files SET pending=0 WHERE id=?");
 		Statement record(sql, "INSERT INTO dedup_totals VALUES (?,?,?,1)"
 			" ON CONFLICT(source,destination) DO UPDATE SET bytes=bytes+excluded.bytes, ranges=ranges+1");
@@ -689,11 +731,13 @@ public:
 				chunks.bind(1, id);
 				Fd source;
 				Integer source_id = 0;
+				Integer completed_until = 0;
 				while (!stopping && chunks.next()) {
 					const auto offset = chunks.number(0);
 					const auto length = chunks.number(1);
-					Extents before;
-					bool mapped = false;
+					if (offset + length <= completed_until) {
+						continue;
+					}
 					sources.bind(1, chunks.number(2)).bind(2, length).bind(3, fsid).bind(4, repo);
 					while (!stopping && sources.next()) {
 						if (source_id != sources.number(0)) {
@@ -704,21 +748,56 @@ public:
 						if (!source) {
 							continue;
 						}
-						if (!mapped) {
-							before = extent_map(dest, offset, length);
-							mapped = true;
+						const auto source_offset = sources.number(11);
+						const auto limit = std::min(max_dedup_size, dest_stamp.values[2] - offset);
+						auto requested = length;
+						if (length == static_cast<Integer>(chunk_size) && length < limit) {
+							// Keep the first source for every chunk, including repeated
+							// content within a file, so batching preserves space savings.
+							consecutive.bind(1, source_id).bind(2, source_offset).bind(3, offset)
+								.bind(4, id).bind(5, offset + length).bind(6, offset + limit)
+								.bind(7, fsid).bind(8, repo);
+							while (consecutive.next()) {
+								if (!consecutive.number(2) || consecutive.number(0) != offset + requested ||
+									consecutive.number(1) > limit - requested) {
+									break;
+								}
+								requested += consecutive.number(1);
+							}
+							consecutive.reset();
 						}
-						crucible::BtrfsExtentSame same(source, sources.number(11), length);
-						same.add(dest, offset);
+						const auto before = extent_map(dest, offset, requested);
 						int status = 0;
-						try {
-							same.do_ioctl();
-							status = same.m_info.front().status;
-						} catch (const std::system_error &error) {
-							status = -error.code().value();
+						uint64_t accepted = 0;
+						for (;;) {
+							crucible::BtrfsExtentSame same(source, source_offset, requested);
+							same.add(dest, offset);
+							try {
+								same.do_ioctl();
+								status = same.m_info.front().status;
+								accepted = same.m_info.front().bytes_deduped;
+							} catch (const std::system_error &error) {
+								status = -error.code().value();
+							}
+							if (status == 0) {
+								break;
+							}
+							++activity.rejected_ranges;
+							last_error = status;
+							if (status == -ENOSPC || status == -ENOMEM || status == -EAGAIN || status == -EINTR) {
+								retry = true;
+								break;
+							}
+							if (requested == length || stopping) {
+								break;
+							}
+							// A stale later chunk must not hide a valid first chunk.
+							requested = length;
+						}
+						if (retry) {
+							break;
 						}
 						if (status == 0) {
-							const auto accepted = same.m_info.front().bytes_deduped;
 							const auto added = newly_shared(before, dest, offset, accepted);
 							if (added && current(dest, dest_stamp)) {
 								record.bind(1, sources.bytes(2)).bind(2, root).bind(3, added).run();
@@ -726,12 +805,8 @@ public:
 							}
 							bytes += accepted;
 							++activity.matched_ranges;
-							break;
-						}
-						++activity.rejected_ranges;
-						last_error = status;
-						if (status == -ENOSPC || status == -ENOMEM || status == -EAGAIN || status == -EINTR) {
-							retry = true;
+							completed_until = offset + accepted;
+							retry = accepted < static_cast<uint64_t>(length);
 							break;
 						}
 					}
@@ -827,8 +902,9 @@ try {
 		case 'h':
 			std::cout << "Usage: project-bees [--root DIR]... [--state-dir DIR]\n"
 				"                    [--interval SECONDS] [--once | --discover | --stats]\n"
-				"Discover Git repositories on mounted writable Btrfs filesystems and deduplicate\n"
-				"ranges across repositories. The default interval is 300 seconds after each pass.\n"
+				"Discover Git repositories and standalone build/dependency directories on mounted\n"
+				"writable Btrfs filesystems and deduplicate ranges across scopes.\n"
+				"The default interval is 300 seconds after each pass.\n"
 				"--stats prints the daemon's cumulative statistics as JSON.\n";
 			return 0;
 		default: return 2;
