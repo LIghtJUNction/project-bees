@@ -4,3 +4,4 @@
 !*.cc
 !*.h
 !project-bees.py
+!project-bees-benchmark.py
