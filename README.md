@@ -1,8 +1,9 @@
 # project-bees
 
 `project-bees` is a fork of [Zygo/bees](https://github.com/Zygo/bees) that
-shares identical Btrfs file ranges across local Git repositories and standalone
-`target` and `node_modules` directories. It runs as a regular user and uses the
+shares identical Btrfs file ranges across local Git repositories, common language
+build and dependency directories, package caches, and user application data.
+It runs as a regular user and uses the
 upstream CityHash and Btrfs extent-same code. Btrfs
 compares the data in the kernel before sharing storage. Subsequent writes use
 copy-on-write.
@@ -38,7 +39,10 @@ omarchy plugin add https://github.com/LIghtJUNction/omarchy-project-bees --enabl
 Click its bar widget or run
 `omarchy-shell shell summon io.github.lightjunction.project-bees` to open it.
 The dashboard also shows whether the latest snapshot reports indexing,
-deduplication, a wait before the next scan, or a stopped daemon.
+deduplication, a wait before the next scan, or a stopped daemon. With plugin
+0.1.3, its progress area shows the priority/full pass, current priority directory,
+file and chunk counts, and phase age. Its live log shows the latest actual
+file-to-file sharing records with their newly shared bytes.
 The plugin is independently maintained under the MIT license and pinned in
 this repository at `plugins/project-bees` as a Git submodule. It reads the
 daemon's local statistics snapshot.
@@ -56,10 +60,54 @@ bin/project-bees --once
 ```
 
 `--discover` lists the discovered scope roots without creating an index.
-`--once` performs one scan and deduplication pass. With neither flag the daemon
+`--once` performs one scan cycle, including its priority passes. With neither flag the daemon
 waits five minutes after each pass, then picks up new repositories, changed
 files, and deletions. Use `--interval SECONDS` to change that delay, or repeat
-`--root DIR` to limit where it looks for repositories.
+`--root DIR` to limit where it looks for scopes. A limited scan uses one full
+pass by default. Add `--priority-root DIR` to process a directory inside that
+limit earlier; the option never widens an explicit `--root` limit.
+
+### Scan order and language directories
+
+Default system scans process `/var/tmp` and common language caches first, then
+the XDG cache, data, configuration and state directories, followed by a complete
+discovery pass. Each priority directory is scanned and deduplicated before the
+next one. This order is a heuristic based on where repeated builds and installed
+dependencies accumulate; contents still determine whether a match is valid.
+
+| Area | Discovery examples |
+| --- | --- |
+| JavaScript / TypeScript | `node_modules`, `.yarn`, `.next`, `.nuxt`, `.svelte-kit`, `.parcel-cache`, `.turbo`; npm, Yarn, pnpm and Bun caches |
+| Rust / JVM | `target`, `.gradle`; Cargo registry/Git, Rustup toolchains, Maven, Gradle, Ivy and Coursier caches |
+| Python | `.venv`, `venv`, `site-packages`, `__pycache__`, `.tox`, `.nox`; pip, uv and Poetry caches |
+| C/C++ / .NET | CMake build trees; manifest-qualified `build`, `bin`, `obj`, `out`, `artifacts`; ccache, sccache and NuGet caches |
+| Other language ecosystems | `.dart_tool`, `Pods`, `.build`, Zig caches/output, `_build`, `.stack-work`, `dist-newstyle`, `_opam`; Composer, Bundler, Go, Pub and other package caches |
+| User application files | `${XDG_CACHE_HOME:-~/.cache}`, `${XDG_DATA_HOME:-~/.local/share}`, `${XDG_CONFIG_HOME:-~/.config}`, `${XDG_STATE_HOME:-~/.local/state}` |
+
+An arbitrary directory containing `pyvenv.cfg` or `CMakeCache.txt` is also
+recognized. Generic names such as `build`, `dist`, `bin`, `obj`, `vendor` and
+`deps` require a supported project manifest in that directory or its parent.
+This avoids treating every system `bin` or unrelated `build` directory as a
+project output tree. Relevant absolute cache environment variables are honored;
+relative XDG paths fall back to the default user directories.
+
+The directory conventions follow the [XDG specification](https://specifications.freedesktop.org/basedir/latest/),
+[Python virtual-environment documentation](https://docs.python.org/3/library/venv.html),
+[CMake build-tree documentation](https://cmake.org/cmake/help/latest/manual/cmake.1.html),
+and [Cargo home documentation](https://doc.rust-lang.org/cargo/guide/cargo-home.html).
+
+To prioritize another directory while retaining a limited full pass:
+
+```sh
+project-bees --root "$HOME/work" --priority-root "$HOME/work/app/target" --once
+```
+
+A priority subtree inherits the same Git or artifact owner as the full pass.
+Partial scans retain other indexed files and directories; only the completed
+full scan prunes missing entries. Priority deduplication processes the current
+batch, while the existing index remains available for finding source files.
+Other pending work is left for the final full pass. An unchanged file may be
+visited again in the full pass, but its cached content hash is retained.
 
 ### Run in the background
 
@@ -102,6 +150,13 @@ repositories; a source subtotal records the other side of the operation.
 | `pairs[].a`, `pairs[].b` | The two repository paths in byte order |
 | `pairs[].bytes` | Pair total across both directions |
 | `pairs[].toA` | Bytes credited to `a`; the remainder is credited to `b` |
+| `recentEvents[]` | Up to 32 recent positive sharing records from the current daemon process |
+
+Each recent event contains `at` (Unix seconds), `source` and `destination`
+file paths, and `bytes`. Consecutive newly shared ranges for the same file pair
+are combined into one record. Already shared matches add no event. Records
+survive scan-phase changes but reset when the daemon restarts; they are a bounded
+live view, while the cumulative totals remain persistent.
 
 The project destination totals, project source totals, and pair totals each
 sum to `totalBytes`. Repository and pair lists are sorted by credited bytes.
@@ -118,8 +173,9 @@ user and contains local repository paths.
 
 ### Activity and an initial total of zero
 
-Each pass first indexes the repository files, then deduplicates matching
-ranges. The first index can take a long time on a large repository tree.
+Each pass first indexes its scope files, then deduplicates matching ranges.
+Priority passes can produce shared data before the full discovery pass finishes.
+The first index can take a long time on a large directory tree.
 During that stage, the newly shared total can stay at zero while the file and
 chunk counters grow. A zero total by itself does not show whether the daemon
 is working. The default 300-second interval is the delay **after both stages
@@ -132,6 +188,8 @@ statistics above keep their history.
 | Activity field | Meaning |
 | --- | --- |
 | `phase` | `scanning`, `deduplicating`, `idle`, or `stopped` |
+| `scanKind` | `priority` or `full` (added in 0.1.3) |
+| `scanRoot` | Current priority directory, or an empty string during the full pass |
 | `phaseStartedAt` | Time this phase began, as Unix seconds |
 | `repositories` | Git or standalone build/dependency scope visits in the current scan |
 | `scannedFiles` | Eligible file visits in the current scan, including cached files |
@@ -141,6 +199,11 @@ statistics above keep their history.
 | `matchedRanges` | Ranges accepted by Btrfs, including already shared ranges |
 | `rejectedRanges` | Deduplication attempts rejected by Btrfs |
 | `nextScanAt` | Planned next scan time while idle; zero in other phases |
+
+Progress is published periodically as work advances, with a ten-second target
+between updates. A slow filesystem operation or a large file can delay an update;
+there is no reliable total-file count before discovery finishes, so the dashboard
+uses actual counts and phase age instead of a synthetic percentage.
 
 Read the activity together with `updatedAt`: a saved phase is not a liveness
 check. The dashboard marks old active snapshots as stale instead of claiming
@@ -182,10 +245,14 @@ metadata on each pass while preserving cached content hashes.
   Btrfs filesystems. It detects regular Git checkouts, linked worktrees,
   submodules and bare repositories, and gives nested repositories their own
   scope. Symlinks, hard-linked files and read-only subvolumes are skipped.
-- A `target` or `node_modules` directory outside a discovered scope becomes
-  its own scope. Inside a Git repository, build and dependency files retain
-  that repository's scope. Nested dependency directories stay in the outer
-  scope. Ordinary files outside these scopes remain excluded.
+- Recognized build or dependency directories outside a concrete Git/artifact
+  scope become their own scopes. Inside a Git repository, build and dependency
+  files retain that repository's scope. Nested dependency directories stay in
+  the outer artifact scope.
+- Explicit cache/application containers and their immediate child directories
+  become separate scopes. A recognized artifact or Git directory beneath a
+  generic application scope can establish its own scope. Ordinary files outside
+  the supported scopes remain excluded, as does the daemon's own state directory.
 - Tracked, untracked and ignored regular files inside these scopes can
   participate, including Git metadata physically located there. Each match
   must span two distinct scope roots on the same Btrfs filesystem.
@@ -208,7 +275,9 @@ discovery of additions and edits. It also checks cumulative totals, restart
 persistence, repeat-scan accounting, and statistics for non-UTF-8 repository
 names, plus activity counters and phase transitions. It also covers combined
 ranges and their size limit, mismatched offsets, sparse holes, hash-collision
-fallback, and incremental candidate selection. `make test` runs the upstream
+fallback, incremental candidate selection, multilingual artifact discovery,
+XDG application scopes, priority ordering and queue isolation, stable subtree
+ownership, and bounded live event records. `make test` runs the upstream
 unit tests. The GitHub workflow runs the Btrfs suite on an isolated loopback
 filesystem.
 

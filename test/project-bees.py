@@ -93,6 +93,8 @@ def check_activity(report, phase=None):
     assert report["version"] == 1, report
     activity = report["activity"]
     assert activity["phase"] in {"scanning", "deduplicating", "idle", "stopped"}, activity
+    assert activity["scanKind"] in {"full", "priority"}, activity
+    assert type(activity["scanRoot"]) is str, activity
     if phase is not None:
         assert activity["phase"] == phase, activity
     for field in ("phaseStartedAt", "repositories", "scannedFiles", "hashedFiles",
@@ -104,6 +106,16 @@ def check_activity(report, phase=None):
         assert activity["nextScanAt"] > activity["phaseStartedAt"], activity
     else:
         assert activity["nextScanAt"] == 0, activity
+    events = report["recentEvents"]
+    assert type(events) is list and len(events) <= 32, events
+    for event in events:
+        assert type(event) is dict, event
+        assert type(event["at"]) is int and 0 < event["at"] <= report["updatedAt"], event
+        assert type(event["bytes"]) is int and event["bytes"] > 0, event
+        assert type(event["source"]) is str and event["source"], event
+        assert type(event["destination"]) is str and event["destination"], event
+    assert [event["at"] for event in events] == sorted(event["at"] for event in events), events
+    assert sum(event["bytes"] for event in events) <= report["totalBytes"], report
     return activity
 
 
@@ -260,6 +272,12 @@ def test_stats_encoding(root):
     assert report["totalBytes"] == (len(names) - 1) * len(content), report
     assert sum(row["bytes"] for row in report["projects"]) == report["totalBytes"]
     assert sum(row["bytes"] for row in report["pairs"]) == report["totalBytes"]
+    events = report["recentEvents"]
+    expected_files = {path + "/common" for path in expected_paths}
+    assert len(events) == len(names) - 1, events
+    assert {event[field] for event in events for field in ("source", "destination")} == expected_files, events
+    assert all(event["bytes"] == len(content) for event in events), events
+    assert sum(event["bytes"] for event in events) == report["totalBytes"], report
     with sqlite3.connect(state / "index.sqlite3") as db:
         assert {row[0] for row in db.execute("SELECT path FROM repositories")} == raw_paths
     subprocess.run(args, check=True, capture_output=True)
@@ -269,6 +287,7 @@ def test_stats_encoding(root):
     assert activity["hashedFiles"] == activity["indexedChunks"] == activity["processedFiles"] == 0, activity
     assert activity["matchedRanges"] == activity["rejectedRanges"] == 0, activity
     assert repeated["totalBytes"] == report["totalBytes"]
+    assert repeated["recentEvents"] == [], repeated
     print("Passed UTF-8 statistics, JSON escaping, exact path keys, and repeat-scan accounting")
 
 
@@ -283,13 +302,17 @@ def make_repositories(root, name, names=("a", "b")):
     return scan, root / (name + "-state"), repositories
 
 
-def run_once(scan, state, expected=None):
+def run_once(scan, state, expected=None, *, env=None, priority_roots=(), output=None):
+    command = [BINARY, "--root", scan, "--state-dir", state, "--once"]
+    for priority in priority_roots:
+        command.extend(["--priority-root", priority])
     process = subprocess.run(
-        [BINARY, "--root", scan, "--state-dir", state, "--once"],
-        text=True, capture_output=True,
+        command, text=True, capture_output=True, env=env,
     )
     assert process.returncode == 0, process.stdout + process.stderr
-    report = json.loads(subprocess.check_output([BINARY, "--state-dir", state, "--stats"]))
+    if output is not None:
+        output.extend(process.stdout.splitlines())
+    report = json.loads(subprocess.check_output([BINARY, "--state-dir", state, "--stats"], env=env))
     check_activity(report, "stopped")
     total = report["totalBytes"]
     if expected is not None:
@@ -298,6 +321,13 @@ def run_once(scan, state, expected=None):
     assert sum(project["sourceBytes"] for project in report["projects"]) == total
     assert sum(pair["bytes"] for pair in report["pairs"]) == total
     return report
+
+
+def discover(scan, state, *, env=None, priority_roots=()):
+    command = [BINARY, "--root", scan, "--state-dir", state, "--discover"]
+    for priority in priority_roots:
+        command.extend(["--priority-root", priority])
+    return subprocess.check_output(command, text=True, env=env).splitlines()
 
 
 def test_coalesced_ranges(root):
@@ -311,11 +341,18 @@ def test_coalesced_ranges(root):
     assert report["activity"]["matchedRanges"] == 6, report
     assert report["activity"]["rejectedRanges"] == 0, report
     assert report["rangeCount"] == 3, report
+    events = report["recentEvents"]
+    assert len(events) == 1, events
+    assert {events[0]["source"], events[0]["destination"]} == {str(source), str(dest)}, events
+    assert events[0]["bytes"] == len(content) == report["totalBytes"], events
     os.utime(source, None)
-    repeated = run_once(scan, state, len(content))
+    lines = []
+    repeated = run_once(scan, state, len(content), output=lines)
     assert repeated["rangeCount"] == report["rangeCount"], repeated
     assert repeated["startedAt"] == report["startedAt"], repeated
     assert repeated["activity"]["hashedFiles"] == 1, repeated
+    assert repeated["recentEvents"] == [], repeated
+    assert any(line.startswith("dedup ranges=") and "newly_shared_bytes=0 " in line for line in lines), lines
     assert source.read_bytes() == dest.read_bytes() == content
     print("Passed bounded range coalescing, tail accounting, and shared-range rescanning")
 
@@ -547,6 +584,256 @@ def test_artifact_discovery(root):
     print("Passed standalone artifact discovery, nested scope ownership, and plain-directory exclusion")
 
 
+def test_language_artifact_discovery(root):
+    scan = root / "language-artifacts"
+    scan.mkdir()
+    state = root / "language-artifacts-state"
+    content = os.urandom(CHUNK_SIZE)
+    members = {}
+    names = (
+        "target", "node_modules", ".venv", "__pycache__", "site-packages", ".gradle",
+        ".dart_tool", "zig-out", ".build", "vendor", "Pods", ".nuxt",
+    )
+    for index, name in enumerate(names):
+        scope = scan / f"language-{index:02d}" / name
+        member = scope / "common"
+        if name == ".venv":
+            member = scope / "lib" / "site-packages" / "package" / "common"
+        member.parent.mkdir(parents=True)
+        if name == "vendor":
+            (scope.parent / "composer.json").write_text('{"name":"test/vendor-fixture"}\n')
+        members[put(member, content)] = scope
+    for name, marker, marker_content in (
+        ("custom-python-env", "pyvenv.cfg", "include-system-site-packages = false\n"),
+        ("custom-cmake-output", "CMakeCache.txt", "CMAKE_BUILD_TYPE:STRING=Release\n"),
+    ):
+        scope = scan / name
+        scope.mkdir()
+        (scope / marker).write_text(marker_content)
+        members[put(scope / "common", content)] = scope
+
+    project = scan / "manifest-project"
+    project.mkdir()
+    (project / "package.json").write_text('{"name":"artifact-test","private":true}\n')
+    generic_names = ("build", "dist", "bin", "obj", "out", "artifacts")
+    for name in generic_names:
+        scope = project / name
+        member = scope / "common"
+        if name == "build":
+            member = scope / "nested" / "target" / "common"
+        member.parent.mkdir(parents=True)
+        members[put(member, content)] = scope
+    excluded = []
+    for name in (*generic_names, "vendor", "targets", "targers", "target-copy"):
+        directory = scan / "unmarked" / name
+        directory.mkdir(parents=True)
+        excluded.append(put(directory / "common", content))
+    (scan / "unmarked" / "target").symlink_to(next(iter(members.values())), target_is_directory=True)
+
+    expected_roots = {str(path) for path in members.values()}
+    discovered = discover(scan, state)
+    assert len(discovered) == len(expected_roots) and set(discovered) == expected_roots, discovered
+    report = run_once(scan, state, (len(members) - 1) * len(content))
+    assert report["activity"]["hashedFiles"] == len(members), report
+    assert {project["path"] for project in report["projects"]} == expected_roots, report
+    reference = next(iter(members))
+    for path in members:
+        assert path.read_bytes() == content
+        assert shared_range(reference, 0, path, 0, len(content)), (path, report)
+    for path in excluded:
+        assert path.read_bytes() == content
+        assert all((extent[5] & FIEMAP_EXTENT_SHARED) == 0 for extent in extents(path)), path
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert set(db.execute("SELECT path,root FROM files")) == {
+            (os.fsencode(path), os.fsencode(scope)) for path, scope in members.items()
+        }
+    print("Passed language artifact names, environment/build markers, and manifest-gated generic directories")
+
+
+def test_xdg_storage_containers(root):
+    scan = root / "xdg-containers"
+    scan.mkdir()
+    env = os.environ.copy()
+    containers = []
+    for key, name in (
+        ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
+        ("XDG_STATE_HOME", "state"), ("XDG_CACHE_HOME", "cache"),
+    ):
+        directory = scan / name
+        directory.mkdir()
+        containers.append(directory)
+        env[key] = str(directory)
+    state = scan / "state" / "project-bees"
+    state.mkdir()
+    content = os.urandom(CHUNK_SIZE)
+    ignored = put(state / "do-not-index", content)
+    plain = scan / "ordinary"
+    plain.mkdir()
+    excluded = put(plain / "common", content)
+    members = {}
+    for container in containers:
+        members[put(container / "common", content)] = container
+        for name in ("app-one", "app-two"):
+            scope = container / name
+            member = scope / "nested" / "files" / "common"
+            member.parent.mkdir(parents=True)
+            members[put(member, content)] = scope
+        artifact_name = "node_modules" if container.name in {"config", "state"} else "target"
+        artifact = container / "app-one" / "projects" / artifact_name
+        member = artifact / "package" / "common"
+        member.parent.mkdir(parents=True)
+        members[put(member, content)] = artifact
+    expected_roots = {str(path) for path in members.values()}
+    discovered = discover(scan, state, env=env)
+    assert len(discovered) == len(expected_roots) and set(discovered) == expected_roots, discovered
+    report = run_once(scan, state, (len(members) - 1) * len(content), env=env)
+    assert report["activity"]["hashedFiles"] == len(members), report
+    assert {project["path"] for project in report["projects"]} == expected_roots, report
+    reference = next(iter(members))
+    for path in members:
+        assert path.read_bytes() == content
+        assert shared_range(reference, 0, path, 0, len(content)), (path, report)
+    for path in (ignored, excluded):
+        assert path.read_bytes() == content
+        assert all((extent[5] & FIEMAP_EXTENT_SHARED) == 0 for extent in extents(path)), path
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert set(db.execute("SELECT path,root FROM files")) == {
+            (os.fsencode(path), os.fsencode(scope)) for path, scope in members.items()
+        }
+        assert {row[0] for row in db.execute("SELECT path FROM repositories")} == {
+            os.fsencode(path) for path in members.values()
+        }
+    print("Passed XDG root/direct-child sharing, nested ownership, and index-state exclusion")
+
+
+def test_priority_pass_preserves_index(root):
+    scan, state, (a, b) = make_repositories(root, "priority-pass", names=("aaa-old-a", "aaa-old-b"))
+    x, y, z = (os.urandom(CHUNK_SIZE) for _ in range(3))
+    old_x = put(a / "x", x)
+    backlog_a = put(a / "backlog", y)
+    backlog_b = put(b / "backlog", y)
+    deleted = put(a / "deleted", z)
+    run_once(scan, state, CHUNK_SIZE)
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        old_ids = dict(db.execute("SELECT path,id FROM files"))
+        assert db.execute(
+            "UPDATE files SET pending=1 WHERE path IN (?,?)",
+            (os.fsencode(backlog_a), os.fsencode(backlog_b)),
+        ).rowcount == 2
+    deleted.unlink()
+    priority = scan / "zzz-priority"
+    fresh = []
+    for name in ("app-one", "app-two", "app-three"):
+        directory = priority / name
+        directory.mkdir(parents=True)
+        fresh.append(put(directory / "x", x))
+    lines = []
+    report = run_once(scan, state, 4 * CHUNK_SIZE, priority_roots=(priority,), output=lines)
+    priority_at = lines.index(f"priority scan root={priority}")
+    full_at = lines.index("full scan")
+    assert priority_at < full_at, lines
+    early = [line for line in lines[priority_at:full_at] if line.startswith("dedup ranges=")]
+    assert len(early) == 1, lines
+    assert "dedup ranges=3 " in early[0], lines
+    assert f"newly_shared_bytes={3 * CHUNK_SIZE} " in early[0], lines
+    activity = report["activity"]
+    assert activity["hashedFiles"] == activity["indexedChunks"] == 0, activity
+    assert activity["scanKind"] == "full" and activity["scanRoot"] == "", activity
+    events = report["recentEvents"]
+    assert len(events) == len(fresh), events
+    assert {event["source"] for event in events} == {str(old_x)}, events
+    assert {event["destination"] for event in events} == {str(path) for path in fresh}, events
+    assert sum(event["bytes"] for event in events) == 3 * CHUNK_SIZE, events
+    # The full pass must drain all three old destinations deferred by priority work.
+    assert activity["processedFiles"] >= 3 and activity["matchedRanges"] >= 3, activity
+    retained = (old_x, backlog_a, backlog_b)
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        final_ids = dict(db.execute("SELECT path,id FROM files"))
+        assert set(final_ids) == {os.fsencode(path) for path in (*retained, *fresh)}
+        assert all(final_ids[os.fsencode(path)] == old_ids[os.fsencode(path)] for path in retained)
+        assert db.execute("SELECT count(*) FROM files WHERE pending<>0").fetchone()[0] == 0
+    assert old_x.read_bytes() == x
+    assert backlog_a.read_bytes() == backlog_b.read_bytes() == y
+    assert shared_range(backlog_a, 0, backlog_b, 0, CHUNK_SIZE)
+    for path in fresh:
+        assert path.read_bytes() == x
+        assert shared_range(old_x, 0, path, 0, CHUNK_SIZE), (path, report)
+    print("Passed priority-before-full execution, early sharing, index retention, and deferred old pending work")
+
+
+def test_nested_repository_priority(root):
+    scan, state, (a, b) = make_repositories(root, "nested-priority")
+    priority = a / "target"
+    (priority / "debug").mkdir(parents=True)
+    content = os.urandom(CHUNK_SIZE)
+    existing = put(priority / "debug" / "old", content)
+    reference = put(b / "common", content)
+    run_once(scan, state, CHUNK_SIZE)
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        old_ids = dict(db.execute("SELECT path,id FROM files"))
+    fresh = put(priority / "debug" / "new", content)
+    discovered = discover(scan, state, priority_roots=(priority,))
+    assert len(discovered) == 2 and set(discovered) == {str(a), str(b)}, discovered
+    lines = []
+    report = run_once(scan, state, 2 * CHUNK_SIZE, priority_roots=(priority,), output=lines)
+    assert lines.index(f"priority scan root={priority}") < lines.index("full scan"), lines
+    assert report["activity"]["hashedFiles"] == 0, report
+    assert {project["path"] for project in report["projects"]} == {str(a), str(b)}, report
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        final_ids = dict(db.execute("SELECT path,id FROM files"))
+        assert all(final_ids[path] == identity for path, identity in old_ids.items())
+        assert set(db.execute("SELECT path,root FROM files")) == {
+            (os.fsencode(existing), os.fsencode(a)),
+            (os.fsencode(fresh), os.fsencode(a)),
+            (os.fsencode(reference), os.fsencode(b)),
+        }
+        assert {row[0] for row in db.execute("SELECT path FROM repositories")} == {os.fsencode(a), os.fsencode(b)}
+    for path in (existing, reference, fresh):
+        assert path.read_bytes() == content
+        assert shared_range(reference, 0, path, 0, CHUNK_SIZE), (path, report)
+    print("Passed nested Git artifact priority with stable repository roots and file IDs")
+
+
+def test_outside_priority_is_ignored(root):
+    scan, state, (repository,) = make_repositories(root, "outside-priority", names=("inside",))
+    content = os.urandom(CHUNK_SIZE)
+    inside = put(repository / "common", content)
+    priority = root / "outside-priority-extra"
+    priority.mkdir()
+    outside = put(priority / "common", content)
+    discovered = discover(scan, state, priority_roots=(priority,))
+    assert discovered == [str(repository)], discovered
+    lines = []
+    report = run_once(scan, state, 0, priority_roots=(priority,), output=lines)
+    assert not any(line.startswith("priority scan root=") for line in lines), lines
+    assert report["activity"]["hashedFiles"] == 1, report
+    assert {project["path"] for project in report["projects"]} == {str(repository)}, report
+    with sqlite3.connect(state / "index.sqlite3") as db:
+        assert set(db.execute("SELECT path,root FROM files")) == {(os.fsencode(inside), os.fsencode(repository))}
+    assert inside.read_bytes() == outside.read_bytes() == content
+    assert all((extent[5] & FIEMAP_EXTENT_SHARED) == 0 for extent in extents(outside))
+    print("Passed explicit scan boundaries without widening them for an outside priority directory")
+
+
+def test_recent_events_limit(root):
+    scan, state, (a, b) = make_repositories(root, "recent-events-limit")
+    content = os.urandom(CHUNK_SIZE)
+    files = [put(repository / f"copy-{index:02d}", content)
+             for repository in (a, b) for index in range(18)]
+    report = run_once(scan, state, 35 * CHUNK_SIZE)
+    events = report["recentEvents"]
+    assert len(events) == 32, events
+    assert len({event["destination"] for event in events}) == 32, events
+    expected_files = {str(path) for path in files}
+    assert all(event["source"] in expected_files and event["destination"] in expected_files for event in events), events
+    assert all(event["bytes"] == CHUNK_SIZE for event in events), events
+    assert sum(event["bytes"] for event in events) == 32 * CHUNK_SIZE, events
+    for path in files:
+        assert path.read_bytes() == content
+        assert shared_range(files[0], 0, path, 0, CHUNK_SIZE), (path, report)
+    print("Passed bounded recent events while preserving cumulative sharing and per-file identity")
+
+
 if __name__ == "__main__":
     test_parent = Path(os.environ.get("PROJECT_BEES_TEST_DIR", BINARY.parents[1])).resolve()
     fstype = subprocess.check_output(["stat", "-f", "-c", "%T", test_parent], text=True).strip()
@@ -563,3 +850,9 @@ if __name__ == "__main__":
         test_cross_file_source_convergence(Path(directory))
         test_completed_scan_pruning(Path(directory))
         test_artifact_discovery(Path(directory))
+        test_language_artifact_discovery(Path(directory))
+        test_xdg_storage_containers(Path(directory))
+        test_priority_pass_preserves_index(Path(directory))
+        test_nested_repository_priority(Path(directory))
+        test_outside_priority_is_ignored(Path(directory))
+        test_recent_events_limit(Path(directory))
