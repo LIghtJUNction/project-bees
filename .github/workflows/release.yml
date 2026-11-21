@@ -1,0 +1,77 @@
+name: Release Project Bees
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version increment
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+      publish:
+        description: Create the Git tag and publish a GitHub Release
+        type: boolean
+        default: false
+
+concurrency:
+  group: project-bees-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Plan the version bump
+        id: plan
+        env:
+          BUMP: ${{ inputs.bump }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          tag=$(python3 scripts/project-bees-release.py "$BUMP" "$GITHUB_SHA" "$GITHUB_RUN_ID")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          {
+            printf '### Project Bees %s\n\n' "$tag"
+            printf 'Source commit `%s`\n\n' "$GITHUB_SHA"
+            if [[ "$PUBLISH" != true ]]; then
+              echo 'Dry run. No tag or GitHub Release will be created.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    needs: plan
+    uses: ./.github/workflows/project-bees.yml
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish
+    needs: [plan, test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Tag the tested commit and publish the release
+        env:
+          BUMP: ${{ inputs.bump }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/project-bees-release.py "$BUMP" "$GITHUB_SHA" "$GITHUB_RUN_ID" \
+            --publish-tag "$TAG" --repo "$GITHUB_REPOSITORY"

@@ -344,6 +344,18 @@ is marked pending so newly possible cross-scope matches are processed.
   that already shared storage. Check filesystem allocation to measure space
   reclaimed.
 
+## Publish a GitHub release
+
+In GitHub Actions, open **Release Project Bees**, select `main` and choose a
+`patch`, `minor`, or `major` bump. The default run shows the next version and
+source commit, then runs the Btrfs tests. Select **Create the Git tag and publish a
+GitHub Release** when you want to publish after the tests pass.
+
+Project Bees takes its release version from the highest stable `vMAJOR.MINOR.PATCH`
+Git tag. A release creates the next tag on the tested commit and publishes
+generated notes and GitHub's source archives. If a run fails after creating its
+tag, rerun that same Actions run while its source is still the tip of `main`.
+
 ## Verify
 
 Run `make test-project-bees` from a Btrfs checkout, or set
