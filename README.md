@@ -81,8 +81,10 @@ limit earlier; the option never widens an explicit `--root` limit.
 ### Scan order and recognized scopes
 
 Default system scans process likely duplicate locations before a complete
-discovery pass: `/var/tmp`, common language caches, application and backup
-containers, and the XDG cache, data, configuration and state directories. Each priority directory is scanned and deduplicated before the
+discovery pass: managed tool installations, local tools, Flatpak application
+data, `/var/tmp`, common language caches, application and backup containers,
+and the XDG cache, data, configuration and state directories.
+Each priority directory is scanned and deduplicated before the
 next one. This order is a heuristic based on where repeated builds and installed
 dependencies accumulate; contents still determine whether a match is valid.
 
@@ -93,8 +95,11 @@ dependencies accumulate; contents still determine whether a match is valid.
 | Python | `.venv`, `venv`, `site-packages`, `__pycache__`, `.tox`, `.nox`; pip, uv and Poetry caches |
 | C/C++ / .NET | CMake build trees; manifest-qualified `build`, `bin`, `obj`, `out`, `artifacts`; ccache, sccache and NuGet caches |
 | Other language ecosystems | `.dart_tool`, `Pods`, `.build`, Zig caches/output, `_build`, `.stack-work`, `dist-newstyle`, `_opam`; Composer, Bundler, Go, Pub and other package caches |
+| Managed tool installations | mise/asdf `installs` and `downloads`, SDKMAN `candidates`, nvm Node versions, pyenv/rbenv versions, uv Python installations |
+| Standalone user tools | Direct regular files in `~/.local/bin`, `${CARGO_HOME:-~/.cargo}/bin`, and `${XDG_DATA_HOME:-~/.local/share}/claude/versions` |
 | Application and backup containers | `/opt`, `~/opt`, `~/.local/opt`, `/var/backups`, `~/Backups`, `~/backups`, `~/备份` |
 | User application files | `${XDG_CACHE_HOME:-~/.cache}`, `${XDG_DATA_HOME:-~/.local/share}`, `${XDG_CONFIG_HOME:-~/.config}`, `${XDG_STATE_HOME:-~/.local/state}` |
+| Flatpak application files | `~/.var/app/<app-id>`, including the application's configuration, data and cache directories |
 
 A directory with a regular `README.md` file is recognized even without `.git`;
 the README name is matched without ASCII case sensitivity. Removing `.git`
@@ -105,6 +110,28 @@ directory containing `pyvenv.cfg` or `CMakeCache.txt` is also recognized. Generi
 This avoids treating every system `bin` or unrelated `build` directory as a
 project output tree. Relevant absolute cache environment variables are honored;
 relative XDG paths fall back to the default user directories.
+
+Known installation layouts are split at the version boundary: for example,
+`mise/installs/node/24.0.0` and `mise/installs/node/24.1.0` are separate scopes.
+This also works when a version manager is itself a Git checkout. Nested build
+and dependency directories stay with their installed version; nested Git
+repositories and recognized backups keep their own identities. Hidden manager
+entries do not create version scopes. The rules match the configured manager
+paths, not every directory named `versions` or `installs`.
+
+Absolute `MISE_DATA_DIR`, `MISE_INSTALLS_DIR`, `MISE_DOWNLOADS_DIR`,
+`UV_PYTHON_INSTALL_DIR`, `NVM_DIR`, `PYENV_ROOT`, `RBENV_ROOT`, `SDKMAN_DIR`
+and `ASDF_DATA_DIR` overrides are supported. The service must receive these
+variables in its own environment to use custom paths. The managed layouts
+follow the [mise directories](https://mise.jdx.dev/directories.html),
+[uv storage](https://docs.astral.sh/uv/reference/storage/), and
+[nvm installation](https://github.com/nvm-sh/nvm#installing-and-updating)
+conventions. Flatpak's per-application paths follow its
+[XDG directory conventions](https://docs.flatpak.org/en/latest/conventions.html#xdg-base-directories).
+
+Direct tool files in the listed executable and Claude version directories
+are individual scopes, so separate binaries can share matching ranges. Symbolic
+links and files with more than one hard link retain the usual exclusions.
 
 Backup names are matched without ASCII case sensitivity. File suffixes include
 `.bak`, `.backup`, `.old`, `.orig`, `.save`, and `~`. The tokens `backup`,
@@ -122,8 +149,10 @@ precedence over stripping a date. A backup does not turn its whole parent
 directory into a scan scope. Backups remain intact; discovery never deletes them.
 
 Only Btrfs files are eligible. Files on tmpfs, including a tmpfs-mounted `/tmp`,
-do not participate. Destination files must be writable by the service's user;
-recognizing a system directory such as `/opt` does not change its permissions.
+do not participate. The kernel enforces permission to deduplicate each destination;
+files owned by the service's user can participate even when their mode is read-only.
+Recognizing a system directory such as `/opt` does not grant access or change its
+permissions. Read-only Btrfs mounts and subvolumes remain excluded.
 
 The directory conventions follow the [XDG specification](https://specifications.freedesktop.org/basedir/latest/),
 [Python virtual-environment documentation](https://docs.python.org/3/library/venv.html),
@@ -140,6 +169,10 @@ A priority subtree inherits the same Git or artifact owner as the full pass.
 Partial scans retain other indexed files and directories; only the completed
 full scan prunes missing entries. Priority deduplication processes the current
 batch, while the existing index remains available for finding source files.
+Source files must remain inside any current explicit root limits. When managed
+installation rules change an old scope, partial scans recheck its current owner
+before using it, so old and new index entries cannot make one version appear
+to be two independent scopes.
 Other pending work is left for the final full pass. An unchanged file may be
 visited again in the full pass, but its cached content hash is retained.
 
@@ -269,11 +302,22 @@ set of new files is fixed for that lookup, so waking an old file does not
 recursively wake other files. All existing index and cumulative statistics
 remain compatible.
 
+Within a deduplication pass, a bounded cache retains up to 64 first candidate
+query results for repeated content keys in the same destination scope and
+filesystem. It preserves source ordering and is discarded before the next pass.
+A cache hit preserves the existing file validation and Btrfs byte comparison.
+An invalid or mismatching first candidate falls back to the remaining sources.
+The cache stores neither file descriptors nor a conclusion that two files match.
+
 Unchanged files are recorded in a temporary integer-ID set during scanning.
 Their persistent index rows are left untouched. A completed scan prunes
 missing or ineligible files through the small file-ID index; an interrupted
 scan keeps unseen rows for the next pass. This avoids rewriting every file's
 metadata on each pass while preserving cached content hashes.
+If only a file's scope changes while its filesystem and complete metadata
+stamp remain unchanged, the daemon revalidates the file and updates its owner
+without reading its contents again. Its existing chunks stay indexed, and it
+is marked pending so newly possible cross-scope matches are processed.
 
 - The discovery pass walks accessible directories on mounted, writable
   Btrfs filesystems. It detects regular Git checkouts, linked worktrees,
@@ -311,7 +355,9 @@ names, plus activity counters and phase transitions. It also covers combined
 ranges and their size limit, mismatched offsets, sparse holes, hash-collision
 fallback, incremental candidate selection, multilingual artifact discovery,
 XDG application scopes, priority ordering and queue isolation, stable subtree
-ownership, and bounded live event records. `make test` runs the upstream
+ownership, managed versions and standalone tool files, legacy scope migration,
+first-candidate cache fallback, scope changes without rehashing,
+and bounded live event records. `make test` runs the upstream
 unit tests. The GitHub workflow runs the Btrfs suite on an isolated loopback
 filesystem.
 
@@ -323,9 +369,11 @@ python3 test/project-bees-benchmark.py --before /path/to/old/project-bees \
 ```
 
 The benchmark creates and removes its own temporary repositories and indexes.
-It measures both a first pass over identical contiguous files and an
-incremental pass with many repeated blocks. Each version receives independent
-copies of the same data; content checks and shared-byte totals must agree.
+It measures a first pass over identical contiguous files and an
+incremental pass with many repeated blocks, plus a first pass with no matching
+content to expose lookup overhead when there is nothing to share. Each version
+receives independent copies of the same data; content checks and shared-byte
+totals must agree.
 JSON output includes per-run timings, kernel request counters, and medians.
 Timings depend on the filesystem and host load, so they are reported without
 a fixed pass/fail speed threshold.

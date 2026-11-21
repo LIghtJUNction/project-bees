@@ -160,7 +160,13 @@ def measure(binary, directory, scenario, content):
         state = root / "state"
         expected = {}
         previous_bytes = 0
-        if scenario == "contiguous":
+        if scenario == "unique-content":
+            file_bytes = len(content) // len(repos)
+            for index, repository in enumerate(repos):
+                write_files([repository], "unique", 1,
+                            content[index * file_bytes:(index + 1) * file_bytes], expected)
+            expected_added = 0
+        elif scenario == "contiguous":
             write_files(repos, "common", 1, content, expected)
             expected_added = (len(repos) - 1) * len(content)
         else:
@@ -183,6 +189,7 @@ def benchmark(before, after, directory, repeats):
     datasets = [
         ("contiguous", random_data.randbytes(4 * 1024 * 1024 + 22133)),
         ("incremental-repeated-chunks", random_data.randbytes(CHUNK_SIZE) * 16),
+        ("unique-content", random_data.randbytes(8 * 2 * 1024 * 1024)),
     ]
     binaries = {"before": before, "after": after}
     result = {
@@ -208,9 +215,9 @@ def benchmark(before, after, directory, repeats):
         result["scenarios"][scenario] = {
             "dataset": {
                 "repositories": 8,
-                "oldFiles": 0 if scenario == "contiguous" else 128,
-                "newFiles": 8 if scenario == "contiguous" else 64,
-                "fileBytes": len(content),
+                "oldFiles": 128 if scenario == "incremental-repeated-chunks" else 0,
+                "newFiles": 64 if scenario == "incremental-repeated-chunks" else 8,
+                "fileBytes": len(content) // 8 if scenario == "unique-content" else len(content),
             },
             "runs": runs,
             "median": {
