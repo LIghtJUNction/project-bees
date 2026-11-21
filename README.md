@@ -354,7 +354,10 @@ GitHub Release** when you want to publish after the tests pass.
 Project Bees takes its release version from the highest stable `vMAJOR.MINOR.PATCH`
 Git tag. A release creates the next tag on the tested commit and publishes
 generated notes and GitHub's source archives. If a run fails after creating its
-tag, rerun that same Actions run while its source is still the tip of `main`.
+tag, choose **Re-run failed jobs** on that same Actions run. It can finish the
+original release while the tagged commit is still in `main`'s history. If the
+original run left no tag, start a new publish run. A new publish run stops if an
+earlier run left an unfinished release.
 
 ## Verify
 

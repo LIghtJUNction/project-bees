@@ -73,5 +73,10 @@ jobs:
           TAG: ${{ needs.plan.outputs.tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          recovery=()
+          # A failed-job rerun gets TAG from the completed plan job's original output.
+          if (( GITHUB_RUN_ATTEMPT > 1 )); then
+            recovery+=(--recover)
+          fi
           python3 scripts/project-bees-release.py "$BUMP" "$GITHUB_SHA" "$GITHUB_RUN_ID" \
-            --publish-tag "$TAG" --repo "$GITHUB_REPOSITORY"
+            --publish-tag "$TAG" --repo "$GITHUB_REPOSITORY" "${recovery[@]}"
