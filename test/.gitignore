@@ -5,3 +5,5 @@
 !*.h
 !project-bees.py
 !project-bees-benchmark.py
+
+!project-bees-control.py

@@ -29,6 +29,8 @@ jobs:
           sudo apt-get install -y g++ make libsqlite3-dev btrfs-progs
       - name: Build
         run: make -j2 project-bees
+      - name: Verify cooperative scan controls without Btrfs
+        run: make test-project-bees-control
       - name: Create an isolated Btrfs filesystem
         run: |
           truncate -s 2G "$RUNNER_TEMP/project-bees.img"
@@ -44,7 +46,7 @@ jobs:
         run: |
           baseline="${BASELINE_REF:-HEAD^}"
           git show "$baseline:src/project-bees.cc" > "$RUNNER_TEMP/project-bees-before.cc"
-          g++ -Wall -Wextra -Werror -O3 -std=c++17 -Iinclude -D_FILE_OFFSET_BITS=64 \
+          g++ -Wall -Wextra -Werror -O3 -std=c++17 -Iinclude -Isrc -D_FILE_OFFSET_BITS=64 \
             -Wold-style-cast -Wno-missing-field-initializers \
             "$RUNNER_TEMP/project-bees-before.cc" lib/libcrucible.a \
             -lpthread -latomic -lsqlite3 -o "$RUNNER_TEMP/project-bees-before"

@@ -84,3 +84,10 @@ help: ## Show help
 
 bees: reallyall
 fly: install
+
+.PHONY: test-project-bees-control
+test-project-bees-control: project-bees ## Test cooperative controls without scanning host mounts
+	$(CXX) -std=c++17 -Wall -Wextra -Werror test/project-bees-control.cc -o bin/project-bees-control-test
+	@fixture=$$(mktemp -d); trap 'rm -rf "$$fixture"' EXIT; bin/project-bees-control-test "$$fixture"
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -Iinclude $(CXXFLAGS) test/project-bees-control-loop.cc -Llib $(LDFLAGS) -lcrucible -lpthread -latomic -lsqlite3 -o bin/project-bees-control-loop-test
+	python3 test/project-bees-control.py

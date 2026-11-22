@@ -396,3 +396,46 @@ a fixed pass/fail speed threshold.
 The [upstream documentation](https://zygo.github.io/bees/) describes the
 original filesystem-wide daemon. This fork retains the upstream source and
 its GPL-3.0-or-later license. Upstream bees copyright 2015–2025 Zygo Blaxell.
+
+### Pause and resume scanning
+
+```sh
+project-bees --pause
+project-bees --status
+project-bees --resume
+```
+
+Use the daemon's `--state-dir` for each command if customized. Commands are
+idempotent; `--pause` also persists across daemon restarts. `--resume` clears
+both manual and automatic requests. `--status` reports `running`, `requested`,
+`paused` (acknowledged by the live daemon), `manual`, and `automatic` separately.
+A resume request may briefly show `requested=0 paused=1` until acknowledged.
+These commands do not start or stop the systemd service. Existing launch options
+and `--stats` JSON remain compatible.
+
+Pause is cooperative: the daemon commits its current batch between directory
+entries or complete files before acknowledging. It retains traversal and index
+state in the same process and continues on resume. Large files, directory reads,
+hashing, SQLite operations and deduplication syscalls can delay acknowledgement;
+there is no immediate-response guarantee for a blocked syscall. A paused daemon
+checks requests once per second and accepts normal SIGINT/SIGTERM shutdown.
+The index lock stays held while paused; `running=0` means any old acknowledgement
+is ignored. Discovery-only mode does not use daemon pause control.
+
+For optional automatic pauses, add `--auto-pause` to your existing daemon command
+(or your own systemd ExecStart override). It is **off by default**. The daemon
+samples Linux `/proc/pressure/memory` `some avg10` at most once per second at safe
+boundaries. At least ten continuous seconds at 20% or above latch an automatic
+pause. Resume manually with `--resume`; pressure dropping never resumes work.
+The trigger rearms only after a valid sample at 10% or below, so sustained high
+pressure does not repeatedly pause after a manual resume. Missing/invalid PSI
+and sampling gaps longer than two seconds break the sustained window; missing
+samples neither resume nor rearm. Platforms without PSI keep manual control and
+skip automatic triggers. This measures memory stall pressure, not general UI
+responsiveness or CPU/IO pressure. No system resource settings are changed.
+
+Unprivileged control tests (use a temporary directory, no Btrfs required):
+
+```sh
+make test-project-bees-control
+```
