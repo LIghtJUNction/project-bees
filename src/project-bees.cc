@@ -1418,9 +1418,9 @@ class Index {
 	const string state;
 	const ScanPolicy &policy;
 	Activity activity;
-	bool auto_pause;
-	PressurePause pressure;
-	const string psi_path;
+	bool auto_pause, auto_pause_io;
+	PressurePause pressure, io_pressure;
+	const string psi_path, io_psi_path;
 	std::chrono::steady_clock::time_point next_control {};
 	std::vector<DedupEvent> recent_events;
 
@@ -1437,8 +1437,10 @@ class Index {
 	}
 
 public:
-	Index(const string &directory, const ScanPolicy &scan_policy, bool automatic = false, string psi = "/proc/pressure/memory")
-		: state(directory), policy(scan_policy), auto_pause(automatic), psi_path(std::move(psi))
+	Index(const string &directory, const ScanPolicy &scan_policy, bool automatic = false, string psi = "/proc/pressure/memory",
+		bool automatic_io = false, string io_psi = "/proc/pressure/io")
+		: state(directory), policy(scan_policy), auto_pause(automatic), auto_pause_io(automatic_io),
+		  psi_path(std::move(psi)), io_psi_path(std::move(io_psi))
 	{
 		lock = open((state + "/lock").c_str(), O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_RDWR, 0600);
 		if (!lock || flock(lock, LOCK_EX | LOCK_NB) < 0) {
@@ -1478,7 +1480,10 @@ public:
 			if (!guard || flock(guard, LOCK_EX) < 0) throw std::runtime_error("cannot lock scan control");
 			if (auto_pause && pressure.sample(std::chrono::duration<double>(now.time_since_epoch()).count(), read_pressure(psi_path)))
 				control_marker(state + "/auto-pause");
-			paused = fs::exists(state + "/pause") || fs::exists(state + "/auto-pause");
+			if (auto_pause_io && io_pressure.sample(std::chrono::duration<double>(now.time_since_epoch()).count(),
+				read_pressure(io_psi_path, "full", "avg60")))
+				control_marker(state + "/auto-pause-io");
+			paused = fs::exists(state + "/pause") || fs::exists(state + "/auto-pause") || fs::exists(state + "/auto-pause-io");
 			if (paused && !fs::exists(state + "/paused")) control_marker(state + "/paused");
 			else if (!paused) fs::remove(state + "/paused");
 			flock(guard, LOCK_UN);
@@ -1896,7 +1901,7 @@ try {
 	bool once = false, discover = false, stats = false;
 	long interval = 300;
 	int control_action = 0;
-	bool automatic = false;
+	bool automatic = false, automatic_io = false;
 	const option options[] = {
 		{"root", required_argument, nullptr, 'r'},
 		{"priority-root", required_argument, nullptr, 'p'},
@@ -1909,6 +1914,8 @@ try {
 		{"resume", no_argument, nullptr, 1001},
 		{"status", no_argument, nullptr, 1002},
 		{"auto-pause", no_argument, nullptr, 1003},
+		{"auto-pause-memory", no_argument, nullptr, 1003},
+		{"auto-pause-io", no_argument, nullptr, 1004},
 		{"help", no_argument, nullptr, 'h'},
 		{nullptr, 0, nullptr, 0},
 	};
@@ -1942,6 +1949,7 @@ try {
 			if (control_action) throw std::runtime_error("choose one control action");
 			control_action = opt; break;
 		case 1003: automatic = true; break;
+		case 1004: automatic_io = true; break;
 		case 'h':
 			std::cout << "Usage: project-bees [--root DIR]... [--state-dir DIR]\n"
 				"                    [--priority-root DIR]...\n"
@@ -1952,7 +1960,8 @@ try {
 				"--priority-root adds an early directory pass within any --root limit.\n"
 				"The default interval is 300 seconds after each pass.\n"
 				"--pause / --resume / --status control the same --state-dir.\n"
-				"--auto-pause enables latched Linux memory PSI pauses (default off).\n"
+				"--auto-pause / --auto-pause-memory enables memory PSI pauses (default off).\n"
+				"--auto-pause-io independently enables I/O full avg60 PSI pauses (default off).\n"
 				"--stats prints the daemon's cumulative statistics as JSON.\n";
 			return 0;
 		default: return 2;
@@ -1970,12 +1979,14 @@ try {
 		Fd guard = open((state + "/control.lock").c_str(), O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_RDWR, 0600);
 		if (!guard || flock(guard, LOCK_EX) < 0) throw std::runtime_error("cannot lock scan control");
 		if (control_action == 1000) control_marker(state + "/pause");
-		if (control_action == 1001) { fs::remove(state + "/pause"); fs::remove(state + "/auto-pause"); }
+		if (control_action == 1001) { fs::remove(state + "/pause"); fs::remove(state + "/auto-pause"); fs::remove(state + "/auto-pause-io"); }
 		Fd daemon = open((state + "/lock").c_str(), O_CLOEXEC | O_NOFOLLOW | O_RDWR);
 		bool running = daemon && flock(daemon, LOCK_EX | LOCK_NB) < 0 && errno == EWOULDBLOCK;
-		std::cout << "running=" << running << " requested=" << (fs::exists(state + "/pause") || fs::exists(state + "/auto-pause"))
+		std::cout << "running=" << running << " requested=" << (fs::exists(state + "/pause") || fs::exists(state + "/auto-pause") || fs::exists(state + "/auto-pause-io"))
 			<< " paused=" << (running && fs::exists(state + "/paused"))
-			<< " manual=" << fs::exists(state + "/pause") << " automatic=" << fs::exists(state + "/auto-pause") << std::endl;
+			<< " manual=" << fs::exists(state + "/pause") << " automatic=" << (fs::exists(state + "/auto-pause") || fs::exists(state + "/auto-pause-io"))
+			<< " automatic_memory=" << fs::exists(state + "/auto-pause")
+			<< " automatic_io=" << fs::exists(state + "/auto-pause-io") << std::endl;
 		return 0;
 	}
 	if (stats) {
@@ -1993,10 +2004,12 @@ try {
 		return 0;
 	}
 	fs::create_directories(state);
-	Index index(state, policy, automatic);
+	Index index(state, policy, automatic, "/proc/pressure/memory", automatic_io);
 	fs::remove(state + "/paused");
 	if (automatic && !read_pressure("/proc/pressure/memory"))
 		std::cerr << "project-bees: memory PSI unavailable; manual pause remains available\n";
+	if (automatic_io && !read_pressure("/proc/pressure/io", "full", "avg60"))
+		std::cerr << "project-bees: I/O PSI unavailable; memory and manual controls remain independent\n";
 	std::cout << "project-bees running, scan interval=" << interval << "s" << std::endl;
 	while (!stopping) {
 		index.checkpoint();

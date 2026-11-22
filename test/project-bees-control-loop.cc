@@ -4,11 +4,11 @@
 #undef main
 int main(int argc, char **argv)
 {
-	if (argc != 3) return 2;
+	if (argc != 3 && argc != 4) return 2;
 	std::signal(SIGTERM, stop);
 	fs::create_directories(argv[1]);
 	const ScanPolicy policy({}, {});
-	Index index(argv[1], policy, true, argv[2]);
+	Index index(argv[1], policy, true, argv[2], argc == 4, argc == 4 ? argv[3] : "");
 	while (!stopping) {
 		index.checkpoint();
 		std::this_thread::sleep_for(std::chrono::seconds(1));

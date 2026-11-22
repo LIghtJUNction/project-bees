@@ -30,4 +30,17 @@ int main(int argc, char **argv) {
 		std::ofstream(fixture) << "some avg10=" << value << "\n";
 		assert(!read_pressure(fixture));
 	}
+	std::ofstream(fixture) << "some avg10=0 avg60=0\nfull avg10=1 avg60=87.0 avg300=0 total=1\n";
+	assert(read_pressure(fixture) == 0);
+	assert(read_pressure(fixture, "full", "avg60") == 87);
+	PressurePause memory, io;
+	for (int i = 0; i <= 10; ++i) {
+		assert(!memory.sample(i, read_pressure(fixture)));
+		assert(io.sample(i, read_pressure(fixture, "full", "avg60")) == (i == 10));
+	}
+	PressurePause spike;
+	assert(!spike.sample(0, 87));
+	assert(!spike.sample(1, 0));
+	assert(!spike.sample(2, 87));
+	assert(!spike.sample(3, std::nullopt));
 }

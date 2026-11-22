@@ -431,11 +431,34 @@ The trigger rearms only after a valid sample at 10% or below, so sustained high
 pressure does not repeatedly pause after a manual resume. Missing/invalid PSI
 and sampling gaps longer than two seconds break the sustained window; missing
 samples neither resume nor rearm. Platforms without PSI keep manual control and
-skip automatic triggers. This measures memory stall pressure, not general UI
-responsiveness or CPU/IO pressure. No system resource settings are changed.
+skip automatic triggers. Memory mode measures memory stall pressure, not general UI
+responsiveness; I/O stall monitoring is separately available below. No system resource settings are changed.
 
 Unprivileged control tests (use a temporary directory, no Btrfs required):
 
 ```sh
 make test-project-bees-control
 ```
+
+For I/O stalls, enable `--auto-pause-io` independently of memory PSI. It reads
+Linux `/proc/pressure/io` **`full avg60`**, so prolonged I/O stalls can pause work
+even when memory remains available. Both sources use the same 20% high / 10% low
+thresholds and ten-second continuous observation window, with separate timers
+and rearming state. `avg60` is a kernel rolling average; the ten-second window
+is additional debounce, not a claim of instant stall detection. A short high
+sample does not trigger. Low or unavailable readings never release a latched
+pause; `--resume` clears both source requests and any manual request.
+
+`--auto-pause-memory` is an explicit alias for the existing `--auto-pause`
+(memory-only, unchanged). To enable both, use:
+
+```sh
+project-bees --auto-pause-memory --auto-pause-io
+```
+
+Both remain off unless selected. An unavailable/invalid source only interrupts
+its own observation window; the other source continues independently. Status
+adds `automatic_memory` and `automatic_io` to identify latched sources while
+retaining the combined `automatic` field. A low reading rearms only its own
+source. These are host PSI signals and cannot prove Project Bees caused the
+stalls. Safe-boundary and blocked-syscall response limits still apply.

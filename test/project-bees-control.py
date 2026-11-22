@@ -126,3 +126,65 @@ with tempfile.TemporaryDirectory() as tmp:
             daemon.send_signal(signal.SIGTERM)
             assert daemon.wait(timeout=5) == 0
 print('missing PSI manual fallback passed')
+
+# Normal memory cannot hide independent I/O full avg60 pressure.
+with tempfile.TemporaryDirectory() as tmp:
+    state = Path(tmp) / 'state'
+    memory = Path(tmp) / 'memory'
+    io = Path(tmp) / 'io'
+    memory.write_text('some avg10=0 avg60=0 total=0\n')
+    def io_pressure(value):
+        staging = io.with_suffix('.new')
+        staging.write_text(f'some avg10=0 avg60=0 total=0\nfull avg10=0 avg60={value} avg300=0 total=1\n')
+        staging.replace(io)
+    io_pressure(0)
+    with (Path(tmp) / 'log').open('w') as log:
+        daemon = subprocess.Popen([str(harness), str(state), str(memory), str(io)], stdout=log, stderr=log)
+        try:
+            wait_for('running=1 requested=0 paused=0')
+            io_pressure(87)
+            time.sleep(2.2) # A short spike must not latch.
+            assert 'requested=0 paused=0' in control('status')
+            io_pressure(0)
+            time.sleep(2.2)
+            assert 'requested=0 paused=0' in control('status')
+            io_pressure(87)
+            deadline = time.monotonic() + 16
+            while time.monotonic() < deadline and not (state / 'paused').exists():
+                time.sleep(.1)
+            status = control('status')
+            assert 'requested=1 paused=1' in status
+            assert 'automatic_memory=0 automatic_io=1' in status
+            def ticks():
+                fields = Path(f'/proc/{daemon.pid}/stat').read_text().split()
+                return int(fields[13]) + int(fields[14])
+            before = ticks()
+            io_pressure(0)
+            time.sleep(2.2)
+            assert ticks() - before <= 5
+            assert 'requested=1 paused=1' in control('status') # Low PSI never resumes.
+            io.unlink()
+            time.sleep(2.2)
+            assert 'requested=1 paused=1' in control('status') # Missing PSI never resumes.
+            control('resume')
+            wait_for('requested=0 paused=0')
+            # Missing memory does not hide available I/O.
+            memory.unlink()
+            io_pressure(87)
+            deadline = time.monotonic() + 16
+            while time.monotonic() < deadline and not (state / 'paused').exists():
+                time.sleep(.1)
+            assert 'automatic_memory=0 automatic_io=1' in control('status')
+            # Missing I/O does not hide available memory.
+            io.unlink()
+            memory.write_text('some avg10=87 avg60=0 total=1\n')
+            control('resume')
+            wait_for('requested=0 paused=0')
+            deadline = time.monotonic() + 16
+            while time.monotonic() < deadline and not (state / 'paused').exists():
+                time.sleep(.1)
+            assert 'automatic_memory=1 automatic_io=0' in control('status')
+        finally:
+            daemon.send_signal(signal.SIGTERM)
+            assert daemon.wait(timeout=5) == 0
+print('independent I/O PSI, transient spike, latched pause and missing-source tests passed')

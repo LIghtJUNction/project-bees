@@ -37,7 +37,8 @@ public:
 	}
 };
 
-inline std::optional<double> read_pressure(const std::string &path)
+inline std::optional<double> read_pressure(const std::string &path, const std::string &category = "some",
+	const std::string &average = "avg10")
 {
 	std::ifstream input(path);
 	std::string line;
@@ -45,11 +46,14 @@ inline std::optional<double> read_pressure(const std::string &path)
 		std::istringstream fields(line);
 		std::string kind, value;
 		fields >> kind >> value;
-		if (kind != "some" || value.rfind("avg10=", 0) != 0) continue;
+		const auto prefix = average + "=";
+		if (kind != category) continue;
+		while (fields && value.rfind(prefix, 0) != 0) fields >> value;
+		if (value.rfind(prefix, 0) != 0) continue;
 		try {
 			size_t end;
-			double result = std::stod(value.substr(6), &end);
-			if (end == value.size() - 6 && std::isfinite(result) && result >= 0 && result <= 100)
+			double result = std::stod(value.substr(prefix.size()), &end);
+			if (end == value.size() - prefix.size() && std::isfinite(result) && result >= 0 && result <= 100)
 				return result;
 		} catch (...) {}
 	}
