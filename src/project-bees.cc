@@ -1359,7 +1359,8 @@ struct Activity {
 	string scan_kind = "full", scan_root;
 	Integer phase_started_at = unix_time();
 	Integer repositories = 0, scanned_files = 0, hashed_files = 0, indexed_chunks = 0;
-	Integer processed_files = 0, matched_ranges = 0, rejected_ranges = 0, next_scan_at = 0;
+	Integer processed_files = 0, matched_ranges = 0, already_shared_ranges = 0, rejected_ranges = 0;
+	Integer next_scan_at = 0;
 };
 
 // Publish a complete snapshot so readers can open it during any index transaction.
@@ -1402,7 +1403,8 @@ void publish_stats(sqlite3 *sql, const string &state, const Activity &activity,
 			'activity', json_object(
 				'phase', CAST(? AS TEXT), 'phaseStartedAt', ?,
 				'repositories', ?, 'scannedFiles', ?, 'hashedFiles', ?, 'indexedChunks', ?,
-				'processedFiles', ?, 'matchedRanges', ?, 'rejectedRanges', ?, 'nextScanAt', ?,
+				'processedFiles', ?, 'matchedRanges', ?, 'alreadySharedRanges', ?,
+				'rejectedRanges', ?, 'nextScanAt', ?,
 				'scanKind', CAST(? AS TEXT), 'scanRoot', CAST(? AS TEXT)),
 			'recentEvents', json(CAST(? AS TEXT)),
 			'projects', json((SELECT json_group_array(json_object(
@@ -1415,8 +1417,9 @@ void publish_stats(sqlite3 *sql, const string &state, const Activity &activity,
 		.bind(3, activity.repositories).bind(4, activity.scanned_files)
 		.bind(5, activity.hashed_files).bind(6, activity.indexed_chunks)
 		.bind(7, activity.processed_files).bind(8, activity.matched_ranges)
-		.bind(9, activity.rejected_ranges).bind(10, activity.next_scan_at)
-		.bind(11, activity.scan_kind).bind(12, activity.scan_root).bind(13, recent).next();
+		.bind(9, activity.already_shared_ranges).bind(10, activity.rejected_ranges)
+		.bind(11, activity.next_scan_at).bind(12, activity.scan_kind).bind(13, activity.scan_root)
+		.bind(14, recent).next();
 	auto data = json_utf8(snapshot.bytes(0));
 	data.push_back('\n');
 	string temp = state + "/.stats.XXXXXX";
@@ -1690,7 +1693,7 @@ public:
 		FirstSourceCache first_sources;
 
 		Integer id = 0;
-		uint64_t bytes = 0, shared = 0, already_shared_ranges = 0;
+		uint64_t bytes = 0, shared = 0;
 		int last_error = 0;
 		unsigned batch = 0;
 		auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -1768,7 +1771,7 @@ public:
 						const auto dest_mapping = shared_mapping(before, offset, requested);
 						if (!dest_mapping.empty() && dest_mapping ==
 							shared_mapping(extent_map(source, source_offset, requested), source_offset, requested)) {
-							++already_shared_ranges;
+							++activity.already_shared_ranges;
 							++activity.matched_ranges;
 							completed_until = offset + requested;
 							break;
@@ -1848,7 +1851,7 @@ public:
 					std::cout << "deduplicating processed_files=" << activity.processed_files
 						<< " matched_ranges=" << activity.matched_ranges
 						<< " newly_shared_bytes=" << shared
-						<< " already_shared_ranges=" << already_shared_ranges << std::endl;
+						<< " already_shared_ranges=" << activity.already_shared_ranges << std::endl;
 					next_report = now + std::chrono::seconds(10);
 				}
 				exec("BEGIN");
@@ -1861,7 +1864,7 @@ public:
 		std::cout << "dedup ranges=" << activity.matched_ranges << " kernel_bytes=" << bytes
 			<< " newly_shared_bytes=" << shared
 			<< " rejected=" << activity.rejected_ranges << " last_status=" << last_error
-			<< " already_shared_ranges=" << already_shared_ranges
+			<< " already_shared_ranges=" << activity.already_shared_ranges
 			<< (stopping ? " interrupted" : "") << std::endl;
 	}
 

@@ -53,7 +53,9 @@ Click its bar widget or run
 The dashboard also shows whether the latest snapshot reports indexing,
 deduplication, a wait before the next scan, or a stopped daemon. With plugin
 0.1.4, its progress area shows the priority/full pass, current priority directory,
-file and chunk counts, and phase age. The live log immediately shows the current
+file and chunk counts, and phase age. Plugin 0.1.5 also shows how many
+already-shared ranges the daemon skipped when running project-bees 0.1.7 or
+later. The live log immediately shows the current
 activity, retains up to 32 observed progress changes, and combines them with up to
 32 actual file-to-file sharing records. Progress and positive newly shared bytes
 are labeled separately.
@@ -266,7 +268,8 @@ statistics above keep their history.
 | `hashedFiles` | Files successfully read and indexed in this scan |
 | `indexedChunks` | Nonzero chunks hashed in this scan |
 | `processedFiles` | Pending files checked during deduplication |
-| `matchedRanges` | Ranges accepted by Btrfs, including already shared ranges |
+| `matchedRanges` | Matching ranges accepted by Btrfs or confirmed to already share the same blocks |
+| `alreadySharedRanges` | Subset of matches that already shared the same blocks and skipped a redundant deduplication request |
 | `rejectedRanges` | Deduplication attempts rejected by Btrfs |
 | `nextScanAt` | Planned next scan time while idle; zero in other phases |
 

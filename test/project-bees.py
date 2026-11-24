@@ -98,10 +98,12 @@ def check_activity(report, phase=None):
     if phase is not None:
         assert activity["phase"] == phase, activity
     for field in ("phaseStartedAt", "repositories", "scannedFiles", "hashedFiles",
-                  "indexedChunks", "processedFiles", "matchedRanges", "rejectedRanges", "nextScanAt"):
+                  "indexedChunks", "processedFiles", "matchedRanges", "alreadySharedRanges",
+                  "rejectedRanges", "nextScanAt"):
         assert type(activity[field]) is int and activity[field] >= 0, activity
     assert 0 < activity["phaseStartedAt"] <= report["updatedAt"], activity
     assert activity["hashedFiles"] <= activity["scannedFiles"], activity
+    assert activity["alreadySharedRanges"] <= activity["matchedRanges"], activity
     if activity["phase"] == "idle":
         assert activity["nextScanAt"] > activity["phaseStartedAt"], activity
     else:
@@ -351,6 +353,7 @@ def test_coalesced_ranges(root):
     assert repeated["rangeCount"] == report["rangeCount"], repeated
     assert repeated["startedAt"] == report["startedAt"], repeated
     assert repeated["activity"]["hashedFiles"] == 1, repeated
+    assert repeated["activity"]["alreadySharedRanges"] == 6, repeated
     assert repeated["recentEvents"] == [], repeated
     assert any(line.startswith("dedup ranges=6 kernel_bytes=0 newly_shared_bytes=0 ")
                and "already_shared_ranges=6" in line for line in lines), lines
