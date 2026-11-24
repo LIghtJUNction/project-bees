@@ -1240,6 +1240,39 @@ bool allocated(const crucible::FiemapExtent &extent)
 	return extent.fe_physical && !(extent.fe_flags & uncertain);
 }
 
+using SharedMapping = std::vector<std::pair<uint64_t, uint64_t>>;
+
+SharedMapping shared_mapping(const Extents &extents, uint64_t offset, uint64_t length)
+{
+	SharedMapping mapping;
+	const auto end = offset + length;
+	for (const auto &extent : extents) {
+		const uint64_t extent_end = extent.fe_logical + extent.fe_length;
+		if (extent_end <= offset) {
+			continue;
+		}
+		// Btrfs reports the encoded extent's base without its decoded offset.
+		// Only plain, fully mapped blocks prove that two ranges already share data.
+		constexpr auto allowed = FIEMAP_EXTENT_SHARED | FIEMAP_EXTENT_LAST;
+		if (extent.fe_logical > offset || !extent.fe_physical ||
+			!(extent.fe_flags & FIEMAP_EXTENT_SHARED) || (extent.fe_flags & ~allowed)) {
+			return {};
+		}
+		const auto physical = extent.fe_physical + (offset - extent.fe_logical);
+		const auto span = std::min(end, extent_end) - offset;
+		if (!mapping.empty() && mapping.back().first + mapping.back().second == physical) {
+			mapping.back().second += span;
+		} else {
+			mapping.emplace_back(physical, span);
+		}
+		offset += span;
+		if (offset == end) {
+			return mapping;
+		}
+	}
+	return {};
+}
+
 uint64_t newly_shared(const Extents &before, int fd, uint64_t offset, uint64_t length)
 {
 	if (!length || std::none_of(before.begin(), before.end(), [](const auto &extent) {
@@ -1657,7 +1690,7 @@ public:
 		FirstSourceCache first_sources;
 
 		Integer id = 0;
-		uint64_t bytes = 0, shared = 0;
+		uint64_t bytes = 0, shared = 0, already_shared_ranges = 0;
 		int last_error = 0;
 		unsigned batch = 0;
 		auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -1732,6 +1765,14 @@ public:
 							consecutive.reset();
 						}
 						const auto before = extent_map(dest, offset, requested);
+						const auto dest_mapping = shared_mapping(before, offset, requested);
+						if (!dest_mapping.empty() && dest_mapping ==
+							shared_mapping(extent_map(source, source_offset, requested), source_offset, requested)) {
+							++already_shared_ranges;
+							++activity.matched_ranges;
+							completed_until = offset + requested;
+							break;
+						}
 						int status = 0;
 						uint64_t accepted = 0;
 						for (;;) {
@@ -1806,7 +1847,8 @@ public:
 					publish();
 					std::cout << "deduplicating processed_files=" << activity.processed_files
 						<< " matched_ranges=" << activity.matched_ranges
-						<< " newly_shared_bytes=" << shared << std::endl;
+						<< " newly_shared_bytes=" << shared
+						<< " already_shared_ranges=" << already_shared_ranges << std::endl;
 					next_report = now + std::chrono::seconds(10);
 				}
 				exec("BEGIN");
@@ -1819,6 +1861,7 @@ public:
 		std::cout << "dedup ranges=" << activity.matched_ranges << " kernel_bytes=" << bytes
 			<< " newly_shared_bytes=" << shared
 			<< " rejected=" << activity.rejected_ranges << " last_status=" << last_error
+			<< " already_shared_ranges=" << already_shared_ranges
 			<< (stopping ? " interrupted" : "") << std::endl;
 	}
 

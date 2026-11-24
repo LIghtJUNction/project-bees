@@ -29,7 +29,7 @@ SEED = 20261121
 TIMEOUT_SECONDS = 180
 METRICS = (
     "wallSeconds", "dedupSeconds", "matchedRanges", "rejectedRanges",
-    "totalBytes", "newlySharedBytes",
+    "kernelBytes", "totalBytes", "newlySharedBytes",
 )
 
 
@@ -46,6 +46,7 @@ def run_daemon(binary, scan, state):
     pending_line = bytearray()
     scan_finished = None
     dedup_finished = None
+    kernel_bytes = None
     started = time.perf_counter()
     deadline = started + TIMEOUT_SECONDS
 
@@ -76,6 +77,7 @@ def run_daemon(binary, scan, state):
                                 scan_finished = observed
                             elif line.startswith(b"dedup ranges="):
                                 dedup_finished = observed
+                                kernel_bytes = int(line.split(b" kernel_bytes=", 1)[1].split()[0])
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(command, TIMEOUT_SECONDS)
@@ -111,6 +113,7 @@ def run_daemon(binary, scan, state):
         "dedupSeconds": dedup_finished - scan_finished,
         "matchedRanges": activity["matchedRanges"],
         "rejectedRanges": activity["rejectedRanges"],
+        "kernelBytes": kernel_bytes,
         "totalBytes": report["totalBytes"],
     }
 
@@ -166,9 +169,14 @@ def measure(binary, directory, scenario, content):
                 write_files([repository], "unique", 1,
                             content[index * file_bytes:(index + 1) * file_bytes], expected)
             expected_added = 0
-        elif scenario == "contiguous":
+        elif scenario in ("contiguous", "already-shared-rescan"):
             write_files(repos, "common", 1, content, expected)
             expected_added = (len(repos) - 1) * len(content)
+            if scenario == "already-shared-rescan":
+                previous_bytes = run_daemon(binary, scan, state)["totalBytes"]
+                assert previous_bytes == expected_added, (binary, previous_bytes)
+                os.utime(next(iter(expected)), None)
+                expected_added = 0
         else:
             write_files(repos, "old", 16, content, expected)
             previous_bytes = run_daemon(binary, scan, state)["totalBytes"]
@@ -186,10 +194,12 @@ def measure(binary, directory, scenario, content):
 
 def benchmark(before, after, directory, repeats):
     random_data = random.Random(SEED)
+    contiguous = random_data.randbytes(4 * 1024 * 1024 + 22133)
     datasets = [
-        ("contiguous", random_data.randbytes(4 * 1024 * 1024 + 22133)),
+        ("contiguous", contiguous),
         ("incremental-repeated-chunks", random_data.randbytes(CHUNK_SIZE) * 16),
         ("unique-content", random_data.randbytes(8 * 2 * 1024 * 1024)),
+        ("already-shared-rescan", contiguous),
     ]
     binaries = {"before": before, "after": after}
     result = {
@@ -215,8 +225,8 @@ def benchmark(before, after, directory, repeats):
         result["scenarios"][scenario] = {
             "dataset": {
                 "repositories": 8,
-                "oldFiles": 128 if scenario == "incremental-repeated-chunks" else 0,
-                "newFiles": 64 if scenario == "incremental-repeated-chunks" else 8,
+                "oldFiles": {"incremental-repeated-chunks": 128, "already-shared-rescan": 8}.get(scenario, 0),
+                "newFiles": {"incremental-repeated-chunks": 64, "already-shared-rescan": 0}.get(scenario, 8),
                 "fileBytes": len(content) // 8 if scenario == "unique-content" else len(content),
             },
             "runs": runs,

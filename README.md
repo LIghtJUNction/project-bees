@@ -14,7 +14,10 @@ The index hashes aligned 128 KiB chunks to find candidate matches. It can merge
 consecutive matching chunks into a request of up to 1 MiB. A matching hash is
 only a candidate: the Btrfs deduplication ioctl compares the actual bytes before
 sharing the physical range. Files keep their names and contents, and later
-writes use copy-on-write. The mechanism follows the upstream
+writes use copy-on-write. When FIEMAP shows that both ranges already map to
+the same uncompressed blocks, the daemon skips the redundant deduplication
+request. The log reports these matches as `already_shared_ranges`. The
+mechanism follows the upstream
 [Btrfs deduplication interface](https://btrfs.readthedocs.io/en/latest/Deduplication.html).
 
 ## Install on Arch Linux

@@ -352,9 +352,30 @@ def test_coalesced_ranges(root):
     assert repeated["startedAt"] == report["startedAt"], repeated
     assert repeated["activity"]["hashedFiles"] == 1, repeated
     assert repeated["recentEvents"] == [], repeated
-    assert any(line.startswith("dedup ranges=") and "newly_shared_bytes=0 " in line for line in lines), lines
+    assert any(line.startswith("dedup ranges=6 kernel_bytes=0 newly_shared_bytes=0 ")
+               and "already_shared_ranges=6" in line for line in lines), lines
     assert source.read_bytes() == dest.read_bytes() == content
     print("Passed bounded range coalescing, tail accounting, and shared-range rescanning")
+
+
+def test_distinct_shared_ranges(root):
+    scan, state, repositories = make_repositories(root, "distinct-shared-ranges")
+    content = os.urandom(CHUNK_SIZE)
+    groups = []
+    for repository in repositories:
+        source = put(repository / "common", content)
+        copy = repository / "copy"
+        subprocess.run(["cp", "--reflink=always", source, copy], check=True, capture_output=True)
+        assert shared(source, copy)
+        groups.append((source, copy))
+    assert not shared(groups[0][0], groups[1][0])
+
+    report = run_once(scan, state)
+    for group in groups:
+        for path in group:
+            assert path.read_bytes() == content
+            assert shared(groups[0][0], path), (path, report)
+    print("Passed convergence of separately shared identical ranges")
 
 
 def test_shifted_and_sparse_ranges(root):
@@ -1583,6 +1604,7 @@ if __name__ == "__main__":
         test(Path(directory))
         test_stats_encoding(Path(directory))
         test_coalesced_ranges(Path(directory))
+        test_distinct_shared_ranges(Path(directory))
         test_shifted_and_sparse_ranges(Path(directory))
         test_coalesced_hash_collision(Path(directory))
         test_first_source_cache_fallback(Path(directory))
