@@ -96,7 +96,7 @@ class ReleaseTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
         self.assertEqual(self.refs(), before)
-        self.assertEqual(self.git("tag", "--list"), "v0.1.5\nv1.0.0-rc.1")
+        self.assertCountEqual(self.git("tag", "--list").splitlines(), ["v0.1.5", "v1.0.0-rc.1"])
         self.assertFalse(self.calls.exists())
 
     def test_version_order_is_numeric(self):
@@ -132,7 +132,9 @@ class ReleaseTest(unittest.TestCase):
         self.git("checkout", "main")
         self.move_main.touch()
         self.assert_stopped(self.run_release(tag="v0.1.6"), "origin/main moved after CI")
-        self.assertEqual(self.git("--git-dir", self.remote, "tag", "--list"), "v0.1.5\nv1.0.0-rc.1")
+        self.assertCountEqual(
+            self.git("--git-dir", self.remote, "tag", "--list").splitlines(), ["v0.1.5", "v1.0.0-rc.1"]
+        )
         self.assertNotIn("release create", self.calls.read_text())
 
     def test_same_run_recovers_after_main_advances(self):
