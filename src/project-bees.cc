@@ -1,3 +1,4 @@
+#include "project-bees-control.h"
 #include "crucible/city.h"
 #include "crucible/fd.h"
 #include "crucible/fs.h"
@@ -12,6 +13,7 @@
 #include <dirent.h>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <fts.h>
 #include <getopt.h>
 #include <iostream>
@@ -41,10 +43,18 @@ namespace fs = std::filesystem;
 constexpr size_t chunk_size = 128 * 1024;
 constexpr Integer max_dedup_size = 1024 * 1024;
 volatile sig_atomic_t stopping = 0;
+std::function<void()> walk_checkpoint;
 
 void stop(int)
 {
 	stopping = 1;
+}
+
+void control_marker(const string &path)
+{
+	Fd fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+	if (!fd) throw std::system_error(errno, std::generic_category(), "write scan control");
+	crucible::write_or_die(fd, "paused\n");
 }
 
 Fd open_path(const string &path, int flags, int dir = AT_FDCWD)
@@ -902,6 +912,8 @@ void walk(const std::vector<string> &requested, const string &state, const ScanP
 		std::vector<WalkScope> scopes;
 		std::vector<DirectoryNames> names;
 		while (!stopping) {
+			if (walk_checkpoint) walk_checkpoint();
+			if (stopping) break;
 			errno = 0;
 			auto *entry = fts_read(tree.get());
 			if (!entry) {
@@ -1442,6 +1454,10 @@ class Index {
 	const string state;
 	const ScanPolicy &policy;
 	Activity activity;
+	bool auto_pause, auto_pause_io;
+	PressurePause pressure, io_pressure;
+	const string psi_path, io_psi_path;
+	std::chrono::steady_clock::time_point next_control {};
 	std::vector<DedupEvent> recent_events;
 
 	void exec(const char *sql) { check(sqlite3_exec(db.get(), sql, nullptr, nullptr, nullptr), db.get()); }
@@ -1457,7 +1473,10 @@ class Index {
 	}
 
 public:
-	Index(const string &directory, const ScanPolicy &scan_policy) : state(directory), policy(scan_policy)
+	Index(const string &directory, const ScanPolicy &scan_policy, bool automatic = false, string psi = "/proc/pressure/memory",
+		bool automatic_io = false, string io_psi = "/proc/pressure/io")
+		: state(directory), policy(scan_policy), auto_pause(automatic), auto_pause_io(automatic_io),
+		  psi_path(std::move(psi)), io_psi_path(std::move(io_psi))
 	{
 		lock = open((state + "/lock").c_str(), O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_RDWR, 0600);
 		if (!lock || flock(lock, LOCK_EX | LOCK_NB) < 0) {
@@ -1485,6 +1504,31 @@ public:
 			"CREATE TABLE IF NOT EXISTS stats_epoch (id INTEGER PRIMARY KEY, started_at INTEGER);"
 			"INSERT OR IGNORE INTO stats_epoch VALUES (1, unixepoch());");
 		publish();
+	}
+
+	void checkpoint()
+	{
+		auto now = std::chrono::steady_clock::now();
+		if (now < next_control || stopping) return;
+		bool paused;
+		do {
+			Fd guard = open((state + "/control.lock").c_str(), O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_RDWR, 0600);
+			if (!guard || flock(guard, LOCK_EX) < 0) throw std::runtime_error("cannot lock scan control");
+			if (auto_pause && pressure.sample(std::chrono::duration<double>(now.time_since_epoch()).count(), read_pressure(psi_path)))
+				control_marker(state + "/auto-pause");
+			if (auto_pause_io && io_pressure.sample(std::chrono::duration<double>(now.time_since_epoch()).count(),
+				read_pressure(io_psi_path, "full", "avg60")))
+				control_marker(state + "/auto-pause-io");
+			paused = fs::exists(state + "/pause") || fs::exists(state + "/auto-pause") || fs::exists(state + "/auto-pause-io");
+			if (paused && !fs::exists(state + "/paused")) control_marker(state + "/paused");
+			else if (!paused) fs::remove(state + "/paused");
+			flock(guard, LOCK_UN);
+			if (paused && !stopping) {
+				std::this_thread::sleep_for(std::chrono::seconds(1));
+				now = std::chrono::steady_clock::now();
+			}
+		} while (paused && !stopping);
+		next_control = std::chrono::steady_clock::now() + std::chrono::seconds(1);
 	}
 
 	void scan(const std::vector<string> &roots, bool complete = true,
@@ -1531,6 +1575,10 @@ public:
 			}
 		};
 		exec("BEGIN");
+		walk_checkpoint = [&] {
+			if (std::chrono::steady_clock::now() < next_control) return;
+			exec("COMMIT"); checkpoint(); exec("BEGIN");
+		};
 		walk(roots, state, policy, [&](const Repository &repo) {
 			add_repo.bind(1, repo.path).bind(2, round).run();
 			++activity.repositories;
@@ -1613,6 +1661,7 @@ public:
 				++activity.hashed_files;
 			}
 		}, complete_roots);
+		walk_checkpoint = {};
 		// An interrupted walk has an incomplete membership set and must not prune.
 		if (complete && !stopping) {
 			Statement prune(sql, "DELETE FROM files WHERE id IN ("
@@ -1843,6 +1892,9 @@ public:
 			if (!stopping) {
 				++activity.processed_files;
 			}
+			if (std::chrono::steady_clock::now() >= next_control) {
+				exec("COMMIT"); checkpoint(); exec("BEGIN");
+			}
 			const auto now = std::chrono::steady_clock::now();
 			if (++batch == 512 || now >= next_report) {
 				exec("COMMIT");
@@ -1870,7 +1922,7 @@ public:
 
 	void idle(long interval) { phase("idle", interval); }
 
-	void finish() { phase("stopped"); }
+	void finish() { fs::remove(state + "/paused"); phase("stopped"); }
 };
 
 string state_directory()
@@ -1894,6 +1946,8 @@ try {
 	string state;
 	bool once = false, discover = false, stats = false;
 	long interval = 300;
+	int control_action = 0;
+	bool automatic = false, automatic_io = false;
 	const option options[] = {
 		{"root", required_argument, nullptr, 'r'},
 		{"priority-root", required_argument, nullptr, 'p'},
@@ -1902,6 +1956,12 @@ try {
 		{"once", no_argument, nullptr, '1'},
 		{"discover", no_argument, nullptr, 'd'},
 		{"stats", no_argument, nullptr, 't'},
+		{"pause", no_argument, nullptr, 1000},
+		{"resume", no_argument, nullptr, 1001},
+		{"status", no_argument, nullptr, 1002},
+		{"auto-pause", no_argument, nullptr, 1003},
+		{"auto-pause-memory", no_argument, nullptr, 1003},
+		{"auto-pause-io", no_argument, nullptr, 1004},
 		{"help", no_argument, nullptr, 'h'},
 		{nullptr, 0, nullptr, 0},
 	};
@@ -1931,6 +1991,11 @@ try {
 		case '1': once = true; break;
 		case 'd': discover = true; break;
 		case 't': stats = true; break;
+		case 1000: case 1001: case 1002:
+			if (control_action) throw std::runtime_error("choose one control action");
+			control_action = opt; break;
+		case 1003: automatic = true; break;
+		case 1004: automatic_io = true; break;
 		case 'h':
 			std::cout << "Usage: project-bees [--root DIR]... [--state-dir DIR]\n"
 				"                    [--priority-root DIR]...\n"
@@ -1940,18 +2005,36 @@ try {
 				"Default system scans prioritize build caches, backups, opt applications, and user data.\n"
 				"--priority-root adds an early directory pass within any --root limit.\n"
 				"The default interval is 300 seconds after each pass.\n"
+				"--pause / --resume / --status control the same --state-dir.\n"
+				"--auto-pause / --auto-pause-memory enables memory PSI pauses (default off).\n"
+				"--auto-pause-io independently enables I/O full avg60 PSI pauses (default off).\n"
 				"--stats prints the daemon's cumulative statistics as JSON.\n";
 			return 0;
 		default: return 2;
 		}
 	}
-	if (optind != argc || once + discover + stats > 1) {
+	if (optind != argc || once + discover + stats + bool(control_action) > 1) {
 		throw std::runtime_error("invalid arguments; see --help");
 	}
 	std::signal(SIGINT, stop);
 	std::signal(SIGTERM, stop);
 	umask(0077);
 	state = fs::weakly_canonical(fs::absolute(state.empty() ? state_directory() : state)).string();
+	if (control_action) {
+		fs::create_directories(state);
+		Fd guard = open((state + "/control.lock").c_str(), O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_RDWR, 0600);
+		if (!guard || flock(guard, LOCK_EX) < 0) throw std::runtime_error("cannot lock scan control");
+		if (control_action == 1000) control_marker(state + "/pause");
+		if (control_action == 1001) { fs::remove(state + "/pause"); fs::remove(state + "/auto-pause"); fs::remove(state + "/auto-pause-io"); }
+		Fd daemon = open((state + "/lock").c_str(), O_CLOEXEC | O_NOFOLLOW | O_RDWR);
+		bool running = daemon && flock(daemon, LOCK_EX | LOCK_NB) < 0 && errno == EWOULDBLOCK;
+		std::cout << "running=" << running << " requested=" << (fs::exists(state + "/pause") || fs::exists(state + "/auto-pause") || fs::exists(state + "/auto-pause-io"))
+			<< " paused=" << (running && fs::exists(state + "/paused"))
+			<< " manual=" << fs::exists(state + "/pause") << " automatic=" << (fs::exists(state + "/auto-pause") || fs::exists(state + "/auto-pause-io"))
+			<< " automatic_memory=" << fs::exists(state + "/auto-pause")
+			<< " automatic_io=" << fs::exists(state + "/auto-pause-io") << std::endl;
+		return 0;
+	}
 	if (stats) {
 		std::ifstream report(state + "/stats.json");
 		if (!report) {
@@ -1967,9 +2050,16 @@ try {
 		return 0;
 	}
 	fs::create_directories(state);
-	Index index(state, policy);
+	Index index(state, policy, automatic, "/proc/pressure/memory", automatic_io);
+	fs::remove(state + "/paused");
+	if (automatic && !read_pressure("/proc/pressure/memory"))
+		std::cerr << "project-bees: memory PSI unavailable; manual pause remains available\n";
+	if (automatic_io && !read_pressure("/proc/pressure/io", "full", "avg60"))
+		std::cerr << "project-bees: I/O PSI unavailable; memory and manual controls remain independent\n";
 	std::cout << "project-bees running, scan interval=" << interval << "s" << std::endl;
 	while (!stopping) {
+		index.checkpoint();
+		if (stopping) break;
 		for (const auto &path : policy.priority_roots(roots)) {
 			// Explicitly limited scans keep their original single-pass behavior
 			// unless the caller requests an early pass as well.
@@ -1998,6 +2088,7 @@ try {
 		}
 		index.idle(interval);
 		for (long seconds = 0; seconds < interval && !stopping; ++seconds) {
+			index.checkpoint();
 			std::this_thread::sleep_for(std::chrono::seconds(1));
 		}
 	}
